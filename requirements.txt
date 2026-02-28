@@ -1,0 +1,9 @@
+aiohttp
+requests
+pandas
+numpy
+xgboost
+scikit-learn
+cryptography
+boto3
+rich

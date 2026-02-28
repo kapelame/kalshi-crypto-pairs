@@ -1,0 +1,15 @@
+# Secrets & keys
+*.pem
+.env
+
+# Data files
+*.db
+*.csv
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# Claude Code
+.claude/
