@@ -495,178 +495,64 @@ class RiskManager:
 
 
 # ==============================================================================
-# Strategy v3 — consensus trend following
+# Strategy — IMPLEMENT YOUR OWN
 # ==============================================================================
+#
+# This is where your trading logic goes. The function below receives live
+# market data for all assets and must return a dict of trade signals.
+#
+# Available data per asset (in `markets[asset]`):
+#   mid              - market mid price (probability 0-1)
+#   spread           - bid-ask spread
+#   time_to_expiry   - seconds until settlement
+#   floor_strike     - reference price contract must beat for YES
+#   real_price       - live Coinbase spot price
+#   price_vs_strike_pct - (real_price - floor_strike) / floor_strike * 100
+#   ob_imbalance     - orderbook imbalance (-1 to +1, positive = YES heavy)
+#   volume           - total volume traded
+#   ticker           - current market ticker
+#
+# TrendTracker provides:
+#   tracker.price_trend(asset, window_sec)  - price change % over window
+#   tracker.realized_vol(asset, window_sec) - annualized volatility estimate
+#
+# Return format: {asset: (side, edge, info_dict)}
+#   side = "YES" | "NO" | None (no trade)
+#   edge = estimated edge (0-1), must exceed RiskManager.min_edge
+#   info_dict = any extra data you want logged (z_score, model_p, etc.)
+#
+# Example strategies to try:
+#   - Z-score: pvs / expected_vol → Φ(z) → compare to market mid
+#   - ML model: train on collector data, predict settlement outcome
+#   - Cross-asset consensus: if 3/4 assets agree on direction, follow
+#   - Mean reversion: fade extreme orderbook imbalances
+#   - Momentum: follow price_vs_strike trend in first 5 minutes
 
-def compute_asset_signal(tracker: TrendTracker, asset: str,
-                         mid: float, pvs: float, tte: float,
-                         ob: float) -> dict:
-    info = {"z": 0, "model_p": 0.5, "raw_side": None, "raw_edge": 0,
-            "vol": 0, "trend": 0, "valid": False}
+def your_strategy(tracker: TrendTracker, markets: dict
+                  ) -> Dict[str, Tuple[Optional[str], float, dict]]:
+    """
+    Implement your strategy here.
 
-    if pvs is None or tte is None or mid is None or tte < 60:
-        return info
-    if not (0.10 <= mid <= 0.90):
-        return info
+    Args:
+        tracker: TrendTracker with price history and settlement results
+        markets: dict of {asset: market_data} from Poller.poll_all()
 
-    # 1. 波动率
-    rv = tracker.realized_vol(asset)
-    vol_15m = rv if rv is not None else DEFAULT_VOL_15M.get(asset, 0.20)
-    vol_15m = max(vol_15m, 0.03)
-    info["vol"] = round(vol_15m, 4)
-
-    # 2. Z-score
-    vol_per_sec = vol_15m / math.sqrt(900)
-    expected_std = vol_per_sec * math.sqrt(max(tte, 1))
-    z = pvs / expected_std if expected_std > 0.001 else 0
-    info["z"] = round(z, 3)
-
-    # 3. model_p = Φ(z)
-    model_p = 0.5 * (1 + math.erf(z / math.sqrt(2)))
-
-    # 4. 趋势微调 (±2%)
-    trend_15m = tracker.price_trend(asset, 900) or 0
-    trend_adj = max(-0.02, min(0.02, trend_15m * 0.05))
-    model_p = max(0.02, min(0.98, model_p + trend_adj))
-    info["trend"] = round(trend_15m, 4)
-
-    # 5. OB微调 (±1%)
-    ob_val = ob if ob is not None else 0
-    ob_adj = max(-0.01, min(0.01, ob_val * 0.015))
-    model_p = max(0.02, min(0.98, model_p + ob_adj))
-
-    info["model_p"] = round(model_p, 4)
-    info["valid"] = True
-
-    if model_p > 0.5:
-        info["raw_side"] = "YES"
-    elif model_p < 0.5:
-        info["raw_side"] = "NO"
-    info["raw_edge"] = abs(model_p - mid)
-
-    return info
-
-
-def consensus_strategy(tracker: TrendTracker, markets: dict
-                       ) -> Dict[str, Tuple[Optional[str], float, dict]]:
-    """v3 strategy: z-score calibrated probability + cross-asset consensus"""
+    Returns:
+        dict of {asset: (side, edge, info)}
+        side: "YES", "NO", or None
+        edge: float, your estimated edge (will be checked against min_edge)
+        info: dict with any signal metadata for logging
+    """
     results = {}
-
-    signals = {}
     for a in ASSETS:
-        m = markets.get(a, {})
-        if m.get("error"):
-            signals[a] = {"valid": False}
-            continue
-        mid = m.get("mid")
-        pvs = m.get("price_vs_strike_pct")
-        tte = m.get("time_to_expiry")
-        ob = m.get("ob_imbalance") or 0
-        signals[a] = compute_asset_signal(tracker, a, mid, pvs, tte, ob)
-
-    # Cross-asset consensus
-    valid_signals = {a: s for a, s in signals.items() if s.get("valid")}
-    n_valid = len(valid_signals)
-
-    n_yes = sum(1 for s in valid_signals.values() if s["model_p"] > 0.5)
-    n_no = sum(1 for s in valid_signals.values() if s["model_p"] < 0.5)
-    z_values = [s["z"] for s in valid_signals.values()]
-    avg_z = sum(z_values) / len(z_values) if z_values else 0
-
-    if n_valid >= 3:
-        majority = max(n_yes, n_no)
-        agreement = majority / n_valid
-    else:
-        agreement = 0.5
-
-    consensus_side = "YES" if n_yes > n_no else ("NO" if n_no > n_yes else None)
-
-    osc = oscillation_score(tracker._settled)
-
-    for a in ASSETS:
-        m = markets.get(a, {})
-        sig = signals[a]
-
-        if not sig.get("valid"):
-            results[a] = (None, 0, sig)
-            continue
-
-        mid = m.get("mid")
-        model_p = sig["model_p"]
-        asset_side = sig["raw_side"]
-
-        # Base confidence
-        if osc > 0.7:
-            base_conf = 0.15
-        elif osc < 0.3 and len(tracker._settled) >= 6:
-            base_conf = 0.35
-        else:
-            base_conf = 0.25
-
-        # Consensus multiplier
-        if n_valid >= 3:
-            if agreement >= 0.99:
-                if asset_side == consensus_side:
-                    consensus_mult = 1.5
-                else:
-                    consensus_mult = 0.0
-            elif agreement >= 0.74:
-                if asset_side == consensus_side:
-                    consensus_mult = 1.0
-                else:
-                    consensus_mult = 0.15
-            else:
-                consensus_mult = 0.3
-        else:
-            consensus_mult = 0.5
-
-        confidence = min(0.45, base_conf * consensus_mult)
-        sig["confidence"] = round(confidence, 3)
-        sig["consensus"] = f"{n_yes}Y{n_no}N"
-        sig["agreement"] = round(agreement, 2)
-        sig["osc"] = round(osc, 2)
-        sig["avg_z"] = round(avg_z, 3)
-
-        if confidence < 0.01:
-            results[a] = (None, 0, sig)
-            continue
-
-        # STRONG CONSENSUS: trend-following mode
-        # 4/4 全票 → 直接做 (历史82%胜率)
-        # 3/4 多数 → avg|z| > 1.0 才做
-        if (n_valid >= 3 and agreement >= 0.74
-                and consensus_side is not None
-                and asset_side == consensus_side):
-            # 3/4 门槛: 仍需 avg_z > 1.0
-            if agreement < 0.99 and abs(avg_z) < 1.0:
-                sig["edge_mode"] = "weak_3/4"
-                results[a] = (None, 0, sig)
-                continue
-
-            z_abs = abs(sig["z"])
-            if agreement >= 0.99:  # 4/4 unanimous
-                base_edge = 0.025
-                z_bonus = min(0.03, 0.015 * z_abs)
-            else:  # 3/4 majority (only if avg_z > 1.0)
-                base_edge = 0.015
-                z_bonus = min(0.02, 0.01 * z_abs)
-            edge = base_edge + z_bonus
-
-            # 计算市场偏差: 市场价和模型预测的差距越大 = 越值得做
-            contract_price = mid if consensus_side == "YES" else (1 - mid)
-            mispricing = abs(model_p - mid)  # 模型 vs 市场的分歧
-            risk_reward = (1 - contract_price) / contract_price if contract_price > 0 else 0
-
-            sig["edge_mode"] = "consensus"
-            sig["mispricing"] = round(mispricing, 4)
-            sig["contract_price"] = round(contract_price, 4)
-            sig["risk_reward"] = round(risk_reward, 3)
-            results[a] = (consensus_side, edge, sig)
-        else:
-            # WEAK/NO CONSENSUS: 不交易
-            sig["edge_mode"] = "no_consensus"
-            results[a] = (None, 0, sig)
-
+        # TODO: implement your signal logic here
+        # m = markets.get(a, {})
+        # mid = m.get("mid")
+        # pvs = m.get("price_vs_strike_pct")
+        # tte = m.get("time_to_expiry")
+        # ob = m.get("ob_imbalance")
+        # ... compute signal ...
+        results[a] = (None, 0, {})  # no signal by default
     return results
 
 
@@ -1179,7 +1065,7 @@ async def main():
             # --- Strategy ---
             # 共识方向全部资产入场，已有仓位的资产会被can_trade跳过
             if not risk.stopped:
-                strat_results = consensus_strategy(tracker, markets)
+                strat_results = your_strategy(tracker, markets)
 
                 for a in ASSETS:
                     m = markets.get(a, {})

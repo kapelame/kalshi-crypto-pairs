@@ -2,10 +2,11 @@
 *.pem
 .env
 
-# Data files
+# Data files (except sample data)
 *.db
 *.csv
 *.log
+!data/sample_features.csv
 
 # Python
 __pycache__/

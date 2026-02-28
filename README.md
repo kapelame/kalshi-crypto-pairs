@@ -1,158 +1,161 @@
 # Kalshi Trading Framework
 
-An end-to-end framework for trading on [Kalshi](https://kalshi.com) — the first regulated US event contract exchange. Covers data collection, ML model training, backtesting, paper trading, live execution, and monitoring.
+An end-to-end framework for trading on [Kalshi](https://kalshi.com) — the first regulated US event contract exchange. Covers data collection, ML training, backtesting, paper trading, live execution, and real-time monitoring.
 
-Currently implemented for **crypto 15-minute markets** (BTC, ETH, SOL, XRP), but the architecture generalizes to any Kalshi event series. The collector, ML pipeline, fee model, risk manager, and execution layer are all modular and reusable.
+Currently wired for **crypto 15-minute markets** (BTC, ETH, SOL, XRP), but the architecture generalizes to any Kalshi series. **Strategy logic is intentionally left empty** — bring your own signals.
 
-## Architecture
+## How It Works
 
-```
-Collector               Polls Kalshi API + external data sources (no auth needed)
-    │
-    ▼
-ML Training             XGBoost / GradientBoosting on settlement outcomes
-    │
-    ▼
-Backtester              Walk-forward CV, strategy variant sweeps
-    │
-    ▼
-Paper Trader            Simulated bankroll, full fee model, SQLite logging
-    │
-    ▼
-Live Trader             Real money via Kalshi RSA-PSS authenticated API
-    │
-    ▼
-Monitor + Reports       Rich terminal dashboard, email alerts via AWS SES
-```
+Each contract asks: *"Will the crypto price go up in the next 15 minutes?"*
+
+- Settlement: if CF Benchmarks 60s average at close >= 60s average at open → YES wins
+- Prices in cents: `yes_bid=24` means 24% implied probability
+- New market opens every 15 minutes with a fresh `floor_strike` reference price
+
+The framework handles everything except the trading strategy: API integration, orderbook data, real-time crypto prices, fee calculation, risk management, order execution, settlement tracking, and monitoring.
 
 ## Quick Start
 
-### 1. Install dependencies
+### 1. Install
 
 ```bash
+git clone https://github.com/kapelame/kalshi-crypto-pairs.git
+cd kalshi-crypto-pairs
 pip install -r requirements.txt
 ```
 
 ### 2. Collect data (no API key needed)
 
 ```bash
-python3 kalshi_collector_v3.py
+python3 collector.py
 ```
 
-Polls Kalshi public market data + Coinbase prices every 2s for 4 hours. Outputs SQLite + CSV. To adapt for other markets, change the `SERIES` dict at the top of the file.
+Polls Kalshi markets + Coinbase prices every 2s for 4 hours. Outputs SQLite + CSV. Sample data is included in `data/` so you can skip this step initially.
 
 ### 3. Check data quality
 
 ```bash
-python3 kalshi_quality_check_v2.py
+python3 quality_check.py
 ```
 
-### 4. Train ML model
+### 4. Train an ML model
 
 ```bash
-python3 kalshi_ml_v3.py
+python3 train.py
 ```
 
-Trains a model to predict settlement outcomes. Reports Brier score, calibration, feature importance, and simulated PnL.
+Trains XGBoost on settlement outcomes. Reports accuracy, Brier score, calibration, and simulated PnL. Uses `data/sample_features.csv` if no collector data is available.
 
 ### 5. Paper trade
 
 ```bash
-python3 kalshi_live_paper.py --duration 7200
+python3 paper_trader.py --duration 7200
 ```
 
-Runs the strategy with a simulated bankroll. All trades logged to SQLite.
+Runs against live markets with simulated bankroll. All trades logged to SQLite.
 
 ### 6. Live trade (requires API key)
 
 ```bash
-cp .env.example .env
-# Edit .env with your Kalshi API credentials
-python3 kalshi_live_trader.py --demo      # Demo mode first
-python3 kalshi_live_trader.py             # Real money
+python3 trader.py --demo      # Demo mode first
+python3 trader.py             # Real money
 ```
 
-### 7. Terminal dashboard
+**Important**: The strategy function `your_strategy()` in `trader.py` is empty by default. You must implement your own signal logic before trading. See the docstring and comments in the strategy section for guidance.
+
+### 7. Monitor
 
 ```bash
-python3 dashboard.py                      # reads kalshi_live_trader.db
-python3 dashboard.py /path/to/other.db    # or specify DB path
+python3 dashboard.py
 ```
 
-Rich terminal dashboard — balance, PnL, win rate, Sharpe, drawdown, sparkline, recent trades, per-asset and per-period stats. Auto-refreshes every 2s.
+Real-time terminal dashboard: live market data (Kalshi odds, Coinbase prices, orderbook), account balance/positions (if API key set), trade history, and performance stats. Refreshes every 2s.
 
-## Configuration
+## API Keys
 
-Copy `.env.example` to `.env` and fill in your values.
+Market data (prices, orderbook) requires **no authentication**. Trading and account data require API keys:
 
-### Getting Kalshi API Access
+1. Create account at [kalshi.com](https://kalshi.com)
+2. Go to **Settings → API Keys**
+3. Generate an RSA key pair, download the private key (`.pem` file)
+4. Configure:
 
-1. Create an account at [kalshi.com](https://kalshi.com)
-2. Go to Settings → API Keys
-3. Generate an RSA key pair and download the private key (`.pem` file)
-4. Set `KALSHI_KEY_ID` and `KALSHI_KEY_FILE` in your `.env`
+```bash
+cp .env.example .env
+# Edit .env:
+# KALSHI_KEY_ID=your-key-id-here
+# KALSHI_KEY_FILE=./kalshi_private.pem
+```
 
-## Adapting to Other Markets
+API docs: [Kalshi API Reference](https://trading-api.readme.io/reference/getting-started)
 
-The framework is designed around Kalshi's series/ticker structure. To trade a different market:
+## Deploying on AWS
 
-1. **Collector**: Change the `SERIES` dict to target your event series (e.g., weather, economics, politics). Add any relevant external data sources alongside the Kalshi orderbook data.
-2. **Features**: Modify the feature engineering in `kalshi_ml_v3.py` to match your market's drivers. The current features (time-to-expiry, price-vs-strike, orderbook imbalance, momentum) are general enough for any time-bounded contract.
-3. **Strategy**: The consensus logic assumes multiple correlated contracts. For single-contract markets, simplify to model probability vs market price edge.
-4. **Risk**: The Kelly sizing, fee model, and exposure limits in the paper/live traders are market-agnostic.
+To run the trader 24/7 on EC2:
+
+```bash
+# 1. Launch an EC2 instance (t3.micro is sufficient)
+# 2. SSH in and clone the repo
+ssh ec2-user@your-ec2-ip
+git clone https://github.com/kapelame/kalshi-crypto-pairs.git
+cd kalshi-crypto-pairs
+pip3 install -r requirements.txt
+
+# 3. Upload your API key
+scp kalshi_private.pem ec2-user@your-ec2-ip:~/kalshi-crypto-pairs/
+
+# 4. Set up environment
+cp .env.example .env
+nano .env  # fill in KALSHI_KEY_ID and KALSHI_KEY_FILE
+
+# 5. Run trader in background
+nohup python3 trader.py --duration 86400 > /dev/null 2>&1 &
+
+# 6. Monitor from your local machine
+# Set TRADER_DB to sync the DB, or just run:
+scp ec2-user@your-ec2-ip:~/kalshi-crypto-pairs/kalshi_live_trader.db .
+python3 dashboard.py
+```
+
+For persistent deployment, use `systemd`, `screen`, or `tmux`.
+
+## Sample Data
+
+`data/sample_features.csv` contains ~2,500 snapshots (~4 hours) with 67 columns per row:
+
+| Feature | Description |
+|---------|-------------|
+| `{asset}_mid` | Market mid price (probability) |
+| `{asset}_spread` | Bid-ask spread |
+| `{asset}_time_to_expiry` | Seconds until settlement |
+| `{asset}_floor_strike` | Reference price to beat |
+| `{asset}_real_price` | Coinbase spot price |
+| `{asset}_price_vs_strike_pct` | % deviation from strike |
+| `{asset}_ob_imbalance` | Orderbook YES/NO ratio (-1 to +1) |
+| `{asset}_mom_*` | Price momentum (5s, 15s, 30s) |
+
+Use this data with `train.py` to build and evaluate models before collecting your own.
 
 ## Modules
 
 | File | Description |
 |------|-------------|
-| **Data Collection** | |
-| `kalshi_collector_v3.py` | Polls markets, orderbooks, and external prices. Tracks market transitions. |
-| `kalshi_collector_v2.py` | Legacy collector using cross-asset averaging (kept for reference). |
-| `kalshi_quality_check_v2.py` | Data quality report: gaps, completeness, TTE coverage, settlement lookup. |
-| **ML & Backtesting** | |
-| `kalshi_ml_v3.py` | XGBoost model training on settlement outcomes with calibration analysis. |
-| `kalshi_paper_trader.py` | Walk-forward backtester — rule-based vs ML comparison with full risk management. |
-| `backtest_v4.py` | Strategy variant sweep (stale guard, contract cap, TTE window, conflict filter). |
-| **Trading** | |
-| `kalshi_live_paper.py` | Paper trader — consensus strategy, fee model, Kelly sizing, SQLite logging. |
-| `kalshi_live_trader.py` | Live trader — RSA-PSS authenticated execution on Kalshi. |
-| **Monitoring** | |
-| `monitor.py` | Rich terminal dashboard — syncs trader DB from remote server via SCP. |
-| `dashboard.py` | Rich terminal dashboard — local DB, 2s refresh, no SCP needed. |
-| `kalshi_report.py` | Email reporter — periodic trading summaries via AWS SES. |
-| **Analysis** | |
-| `analyze_deviation.py` | Outlier vs consensus strategy comparison. |
-| `analyze_factors.py` | Multi-factor win rate analysis (volatility, spread, OB alignment). |
-| `analyze_timing.py` | Optimal entry timing via TTE window sweep. |
+| `collector.py` | Polls Kalshi + Coinbase every 2s. Outputs SQLite + CSV. |
+| `quality_check.py` | Data quality report: gaps, completeness, settlement coverage. |
+| `train.py` | XGBoost model training on settlement outcomes. |
+| `backtester.py` | Walk-forward backtester with configurable strategy variants. |
+| `paper_trader.py` | Live paper trading — real markets, simulated bankroll. |
+| `trader.py` | Live trading — RSA-PSS authenticated orders on Kalshi. |
+| `dashboard.py` | Terminal dashboard — live markets, positions, trade history. |
 
-## Key Concepts
-
-### Kalshi API
-
-- **Base URL**: `https://api.elections.kalshi.com/trade-api/v2`
-- **Auth**: Not needed for market data reads. RSA-PSS signing required for orders.
-- **Rate limit**: 20 reads/sec (basic tier)
-- **Prices**: In cents — `yes_bid=24` means 24% implied probability
-- **Structure**: Series (e.g., `KXBTC15M`) → one open market at a time → ticker changes on each period
-
-### Strategy (Crypto Implementation)
-
-The included crypto strategy uses **cross-asset consensus**:
-
-1. Compute z-score per asset: (price - strike) / expected_volatility
-2. Convert to model probability P(YES) via normal CDF
-3. Check agreement across correlated assets (3/4 or 4/4 consensus)
-4. Trade when consensus is strong, size via fractional Kelly with fee-adjusted edge
-
-This approach exploits correlation between related contracts. The same principle applies to any set of correlated Kalshi markets.
-
-### Fee Model
+## Fee Model
 
 Kalshi charges per-contract fees based on `price * (1 - price)`:
+
 - **Taker**: `ceil(0.07 * contracts * P * (1-P) * 100) / 100`
 - **Maker**: `ceil(0.0175 * contracts * P * (1-P) * 100) / 100`
 
-Fees are highest at P=50% and zero at P=0% or P=100%.
+Fees are highest at P=50% ($0.02/contract) and zero at P=0% or P=100%.
 
 ## License
 
