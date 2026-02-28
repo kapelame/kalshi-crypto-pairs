@@ -72,6 +72,15 @@ python3 kalshi_live_trader.py --demo      # Demo mode first
 python3 kalshi_live_trader.py             # Real money
 ```
 
+### 7. Terminal dashboard
+
+```bash
+python3 dashboard.py                      # reads kalshi_live_trader.db
+python3 dashboard.py /path/to/other.db    # or specify DB path
+```
+
+Rich terminal dashboard — balance, PnL, win rate, Sharpe, drawdown, sparkline, recent trades, per-asset and per-period stats. Auto-refreshes every 2s.
+
 ## Configuration
 
 Copy `.env.example` to `.env` and fill in your values.
@@ -109,6 +118,7 @@ The framework is designed around Kalshi's series/ticker structure. To trade a di
 | `kalshi_live_trader.py` | Live trader — RSA-PSS authenticated execution on Kalshi. |
 | **Monitoring** | |
 | `monitor.py` | Rich terminal dashboard — syncs trader DB from remote server via SCP. |
+| `dashboard.py` | Rich terminal dashboard — local DB, 2s refresh, no SCP needed. |
 | `kalshi_report.py` | Email reporter — periodic trading summaries via AWS SES. |
 | **Analysis** | |
 | `analyze_deviation.py` | Outlier vs consensus strategy comparison. |
