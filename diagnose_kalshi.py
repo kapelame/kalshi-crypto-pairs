@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Read-only diagnostic for one current BTC 15-minute Kalshi market."""
+"""Read-only diagnostic for one current 15-minute Kalshi market."""
 
+import argparse
 import json
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -9,6 +10,10 @@ from kalshi_api import parse_markets_response, parse_orderbook_response
 
 
 BASE = "https://external-api.kalshi.com/trade-api/v2"
+SERIES = {
+    "BTC": "KXBTC15M", "ETH": "KXETH15M", "SOL": "KXSOL15M",
+    "XRP": "KXXRP15M", "DOGE": "KXDOGE15M",
+}
 
 
 def get_json(path, params=None):
@@ -33,10 +38,13 @@ def best(levels):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--asset", choices=SERIES, default="BTC")
+    args = parser.parse_args()
     markets = parse_markets_response(get_json(
-        "/markets", {"series_ticker": "KXBTC15M", "status": "open", "limit": 1}))
+        "/markets", {"series_ticker": SERIES[args.asset], "status": "open", "limit": 1}))
     if not markets:
-        raise RuntimeError("Kalshi returned no open KXBTC15M market")
+        raise RuntimeError(f"Kalshi returned no open {SERIES[args.asset]} market")
     market = markets[0]
     book = parse_orderbook_response(get_json(
         f"/markets/{market['ticker']}/orderbook", {"depth": 10}))

@@ -56,6 +56,7 @@ SERIES = {
     "ETH": {"series": "KXETH15M"},
     "SOL": {"series": "KXSOL15M"},
     "XRP": {"series": "KXXRP15M"},
+    "DOGE": {"series": "KXDOGE15M"},
 }
 ASSETS = list(SERIES.keys())
 
@@ -420,6 +421,12 @@ class DataStore:
 
         col_defs = ", ".join(cols)
         self._conn.execute(f"CREATE TABLE IF NOT EXISTS features ({col_defs})")
+        # Add newly introduced asset columns without replacing historical rows.
+        existing = {row[1] for row in self._conn.execute("PRAGMA table_info(features)")}
+        for definition in cols:
+            column = definition.split()[0]
+            if column not in existing:
+                self._conn.execute(f"ALTER TABLE features ADD COLUMN {definition}")
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_feat_ts ON features(ts_unix)")
 
@@ -522,7 +529,7 @@ class Console:
     def _show_full(self, row: dict, markets: Dict[str, dict], elapsed: float):
         print(f"\n{'=' * W}")
         print(f"  #{self._n}  {row.get('ts','')}  "
-              f"valid:{row.get('n_valid',0)}/4  {elapsed/60:.0f}m")
+                  f"valid:{row.get('n_valid',0)}/{len(ASSETS)}  {elapsed/60:.0f}m")
         print(f"{'=' * W}")
         print(f"  {'ASSET':<5}{'Mid':>6}{'Sprd':>6}{'TTE':>6}"
               f"{'Strike':>10}{'RealP':>10}{'PvS%':>7}"

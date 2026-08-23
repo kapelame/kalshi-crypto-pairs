@@ -42,7 +42,11 @@ if not os.path.exists(CSV) and os.path.exists(DB):
 
 df = pd.read_csv(CSV)
 
-ASSETS = ["btc", "eth", "sol", "xrp"]
+EXPECTED_ASSETS = ["btc", "eth", "sol", "xrp", "doge"]
+ASSETS = [asset for asset in EXPECTED_ASSETS if f"{asset}_ticker" in df.columns]
+MISSING_ASSETS = [asset for asset in EXPECTED_ASSETS if asset not in ASSETS]
+if MISSING_ASSETS:
+    print("  missing asset columns: " + ", ".join(a.upper() for a in MISSING_ASSETS))
 
 print(f"\n{'=' * 70}")
 print(f"  DATA QUALITY REPORT (v2 - for collector v3)")
@@ -186,6 +190,9 @@ print(f"{'=' * 70}")
 
 issues = []
 warnings = []
+
+for asset in MISSING_ASSETS:
+    issues.append(f"{asset.upper()} columns missing; collect new five-asset data")
 
 if len(df) < 1500:
     issues.append(f"rows too few: {len(df)} < 1500 minimum")

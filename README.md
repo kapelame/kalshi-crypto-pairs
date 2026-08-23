@@ -2,7 +2,7 @@
 
 An end-to-end framework for trading on [Kalshi](https://kalshi.com) — the first regulated US event contract exchange. Covers data collection, ML training, backtesting, paper trading, live execution, and real-time monitoring.
 
-Currently wired for **crypto 15-minute markets** (BTC, ETH, SOL, XRP), but the architecture generalizes to any Kalshi series. **Strategy logic is intentionally left empty** — bring your own signals.
+Currently wired for **crypto 15-minute markets** (BTC, ETH, SOL, XRP, DOGE), but the architecture generalizes to any Kalshi series. **Strategy logic is intentionally left empty** — bring your own signals.
 
 ## How It Works
 
@@ -31,6 +31,22 @@ python3 collector.py
 ```
 
 Polls Kalshi markets + Coinbase prices every 2s for 4 hours. Outputs SQLite + CSV. Sample data is included in `data/` so you can skip this step initially.
+
+### Phase 2 read-only stream recording
+
+The high-fidelity recorder keeps the REST collector intact and writes an
+independent append-only raw-event database. Kalshi requires authentication for
+the WebSocket handshake even though the subscribed market-data channels are
+read-only.
+
+```bash
+.venv/bin/python diagnose_stream.py --duration 60
+.venv/bin/python collect_stream.py
+```
+
+See [PHASE2_STREAMING.md](PHASE2_STREAMING.md) for the event schema, credentials,
+timestamp guarantees, channels, and recovery behavior. Neither command imports
+or invokes the trading client.
 
 ### 3. Check data quality
 
@@ -73,7 +89,9 @@ Real-time terminal dashboard: live market data (Kalshi odds, Coinbase prices, or
 
 ## API Keys
 
-Market data (prices, orderbook) requires **no authentication**. Trading and account data require API keys:
+REST market data requires **no authentication**. Kalshi's WebSocket connection
+handshake and all trading/account endpoints require API keys. The Phase 2
+recorder uses credentials only to establish a read-only WebSocket connection:
 
 1. Create account at [kalshi.com](https://kalshi.com)
 2. Go to **Settings → API Keys**
@@ -84,7 +102,7 @@ Market data (prices, orderbook) requires **no authentication**. Trading and acco
 cp .env.example .env
 # Edit .env:
 # KALSHI_KEY_ID=your-key-id-here
-# KALSHI_KEY_FILE=./kalshi_private.pem
+# KALSHI_KEY_FILE=/absolute/path/outside-repo/kalshi_private.pem
 ```
 
 API docs: [Kalshi API Reference](https://trading-api.readme.io/reference/getting-started)
@@ -147,6 +165,8 @@ Use this data with `train.py` to build and evaluate models before collecting you
 | `paper_trader.py` | Live paper trading — real markets, simulated bankroll. |
 | `trader.py` | Live trading — RSA-PSS authenticated orders on Kalshi. |
 | `dashboard.py` | Terminal dashboard — live markets, positions, trade history. |
+| `collect_stream.py` | Read-only five-asset WebSocket/REST raw-event recorder. |
+| `diagnose_stream.py` | Time-limited streaming health and latency diagnostic. |
 
 ## Fee Model
 
