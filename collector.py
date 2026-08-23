@@ -31,16 +31,21 @@ import sys
 import time
 import json
 import math
+import logging
 from datetime import datetime, timezone
 from typing import Optional, Dict, List
 from collections import deque
+
+from kalshi_api import (
+    KalshiSchemaError, parse_markets_response, parse_orderbook_response,
+)
 
 
 # ==============================================================================
 # 配置
 # ==============================================================================
 
-KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2"
+KALSHI_API = "https://external-api.kalshi.com/trade-api/v2"
 COINBASE_API = "https://api.coinbase.com/v2"
 
 POLL_SEC = 2.0          # 2s per cycle (more requests per cycle than v2)
@@ -60,6 +65,12 @@ BACKOFF_BASE = 1.0
 BACKOFF_MAX = 16.0
 PROGRESS_INTERVAL = 300
 OB_DEPTH = 10
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+LOGGER = logging.getLogger("kalshi.collector")
 
 DB_PATH = "kalshi_v3.db"
 CSV_EXPORT = "kalshi_v3_features.csv"
@@ -116,25 +127,30 @@ class Poller:
             url = f"{KALSHI_API}/markets?series_ticker={info['series']}&status=open&limit=1"
             async with s.get(url) as r:
                 if r.status == 429:
+                    LOGGER.warning("market %s rate limited: %s", asset,
+                                   (await r.text())[:300])
                     return {"asset": asset, "error": "rate_limit"}
                 if r.status != 200:
-                    return {"asset": asset, "error": f"HTTP {r.status}"}
+                    body = (await r.text())[:300]
+                    LOGGER.error("market %s HTTP %s: %s", asset, r.status, body)
+                    return {"asset": asset, "error": f"HTTP {r.status}: {body}"}
                 data = await r.json()
 
-            mkts = data.get("markets", [])
+            mkts = parse_markets_response(data)
             if not mkts:
+                LOGGER.warning("market %s: no open %s markets", asset, info["series"])
                 return {"asset": asset, "error": "no_markets"}
 
             m = mkts[0]
-            yb = m.get("yes_bid")  # cents
+            yb = m.get("yes_bid")  # cents, may be fractional
             ya = m.get("yes_ask")
             mid, spread = None, None
-            if yb is not None and ya is not None and yb > 0 and ya > 0:
+            if yb is not None and ya is not None:
                 mid = (yb + ya) / 200.0
                 spread = (ya - yb) / 100.0
-            elif yb and yb > 0:
+            elif yb is not None:
                 mid = yb / 100.0
-            elif ya and ya > 0:
+            elif ya is not None:
                 mid = ya / 100.0
 
             # Parse close_time for time_to_expiry
@@ -166,36 +182,47 @@ class Poller:
                 "status": m.get("status", ""),
                 "yes_bid": yb, "yes_ask": ya,
                 "mid": mid, "spread": spread,
-                "volume": m.get("volume", 0),
-                "oi": m.get("open_interest", 0),
+                "volume": m.get("volume"),
+                "oi": m.get("open_interest"),
                 "floor_strike": m.get("floor_strike"),
                 "close_time": ct,
                 "time_to_expiry": tte,
                 "error": None,
             }
         except asyncio.TimeoutError:
+            LOGGER.error("market %s request timed out", asset)
             return {"asset": asset, "error": "timeout"}
         except aiohttp.ClientError as e:
             self._kal_session = None
+            LOGGER.error("market %s connection error: %s", asset, e)
             return {"asset": asset, "error": f"conn:{type(e).__name__}"}
+        except KalshiSchemaError as e:
+            LOGGER.error("market %s schema error: %s", asset, e)
+            return {"asset": asset, "error": f"schema:{e}"}
         except Exception as e:
+            LOGGER.exception("market %s unexpected failure", asset)
             return {"asset": asset, "error": str(e)[:100]}
 
     # --- Kalshi: orderbook ---
     async def _poll_orderbook(self, asset: str, ticker: str) -> dict:
         if not ticker:
-            return {"asset": asset, "ob_imbalance": None}
+            return {"asset": asset, "ob_imbalance": None,
+                    "error": "missing_ticker"}
         try:
             s = await self._kalshi_sess()
             url = f"{KALSHI_API}/markets/{ticker}/orderbook?depth={OB_DEPTH}"
             async with s.get(url) as r:
+                body = None
                 if r.status != 200:
-                    return {"asset": asset, "ob_imbalance": None}
+                    body = (await r.text())[:300]
+                    LOGGER.error("orderbook %s HTTP %s: %s", ticker, r.status, body)
+                    return {"asset": asset, "ob_imbalance": None,
+                            "error": f"HTTP {r.status}: {body}"}
                 data = await r.json()
 
-            ob = data.get("orderbook", {})
-            yes_bids = ob.get("yes", [])
-            no_bids = ob.get("no", [])
+            ob = parse_orderbook_response(data)
+            yes_bids = ob["yes"]
+            no_bids = ob["no"]
 
             yes_qty = sum(qty for _, qty in yes_bids)
             no_qty = sum(qty for _, qty in no_bids)
@@ -208,9 +235,24 @@ class Poller:
                 "ob_imbalance": round(imbalance, 4) if imbalance is not None else None,
                 "yes_depth_qty": yes_qty,
                 "no_depth_qty": no_qty,
+                "error": None,
             }
-        except:
-            return {"asset": asset, "ob_imbalance": None}
+        except KalshiSchemaError as e:
+            LOGGER.error("orderbook %s schema error: %s", ticker, e)
+            return {"asset": asset, "ob_imbalance": None,
+                    "error": f"schema:{e}"}
+        except asyncio.TimeoutError:
+            LOGGER.error("orderbook %s request timed out", ticker)
+            return {"asset": asset, "ob_imbalance": None, "error": "timeout"}
+        except aiohttp.ClientError as e:
+            self._kal_session = None
+            LOGGER.error("orderbook %s connection error: %s", ticker, e)
+            return {"asset": asset, "ob_imbalance": None,
+                    "error": f"conn:{type(e).__name__}"}
+        except Exception as e:
+            LOGGER.exception("orderbook %s unexpected failure", ticker)
+            return {"asset": asset, "ob_imbalance": None,
+                    "error": str(e)[:100]}
 
     # --- Coinbase: real prices ---
     async def _poll_prices(self) -> Dict[str, Optional[float]]:
@@ -273,6 +315,7 @@ class Poller:
         for a in ASSETS:
             m = markets[a]
             m["ob_imbalance"] = ob_data.get(a, {}).get("ob_imbalance")
+            m["ob_error"] = ob_data.get(a, {}).get("error")
             m["real_price"] = binance_prices.get(a)
 
             # price_vs_strike_pct
@@ -283,7 +326,7 @@ class Poller:
             else:
                 m["price_vs_strike_pct"] = None
 
-            if m.get("error"):
+            if m.get("error") or m.get("ob_error"):
                 has_error = True
 
         if has_error:
@@ -364,8 +407,8 @@ class DataStore:
             cols += [
                 f"{p}_ticker TEXT",
                 f"{p}_mid REAL", f"{p}_spread REAL",
-                f"{p}_yes_bid INTEGER", f"{p}_yes_ask INTEGER",
-                f"{p}_volume INTEGER", f"{p}_oi INTEGER",
+                f"{p}_yes_bid REAL", f"{p}_yes_ask REAL",
+                f"{p}_volume REAL", f"{p}_oi REAL",
                 f"{p}_floor_strike REAL", f"{p}_time_to_expiry REAL",
                 f"{p}_ob_imbalance REAL",
                 f"{p}_real_price REAL", f"{p}_price_vs_strike_pct REAL",
@@ -504,8 +547,8 @@ class Console:
             rp = row.get(f"{p}_real_price")
             pvs = row.get(f"{p}_price_vs_strike_pct")
             obi = row.get(f"{p}_ob_imbalance")
-            vol = row.get(f"{p}_volume", 0)
-            oi = row.get(f"{p}_oi", 0)
+            vol = row.get(f"{p}_volume")
+            oi = row.get(f"{p}_oi")
             mom = row.get(f"{p}_mom_5s")
 
             mid_s = f"{mid:.3f}" if mid is not None else "---"
@@ -517,9 +560,11 @@ class Console:
             obi_s = f"{obi:+.3f}" if obi is not None else "---"
             mom_s = f"{mom:+.4f}" if mom is not None else "---"
 
+            vol_s = f"{vol:.2f}" if vol is not None else "---"
+            oi_s = f"{oi:.2f}" if oi is not None else "---"
             print(f"  {a:<5}{mid_s:>6}{spr_s:>6}{tte_s:>6}"
                   f"{fs_s:>10}{rp_s:>10}{pvs_s:>7}"
-                  f"{obi_s:>7}{vol:>8}{oi:>7}{mom_s:>7}")
+                  f"{obi_s:>7}{vol_s:>8}{oi_s:>7}{mom_s:>7}")
 
     def _show_progress(self, elapsed: float):
         remaining = MAX_RUNTIME - elapsed
@@ -615,8 +660,8 @@ async def main():
                 row[f"{p}_spread"] = m.get("spread")
                 row[f"{p}_yes_bid"] = m.get("yes_bid")
                 row[f"{p}_yes_ask"] = m.get("yes_ask")
-                row[f"{p}_volume"] = m.get("volume", 0)
-                row[f"{p}_oi"] = m.get("oi", 0)
+                row[f"{p}_volume"] = m.get("volume")
+                row[f"{p}_oi"] = m.get("oi")
                 row[f"{p}_floor_strike"] = m.get("floor_strike")
                 row[f"{p}_time_to_expiry"] = m.get("time_to_expiry")
                 row[f"{p}_ob_imbalance"] = m.get("ob_imbalance")
@@ -625,7 +670,8 @@ async def main():
                 row[f"{p}_mom_5s"] = momentum.get(a, ts_unix, 5)
                 row[f"{p}_mom_15s"] = momentum.get(a, ts_unix, 15)
                 row[f"{p}_mom_30s"] = momentum.get(a, ts_unix, 30)
-                row[f"{p}_error"] = m.get("error")
+                errors = [e for e in (m.get("error"), m.get("ob_error")) if e]
+                row[f"{p}_error"] = "; ".join(errors) if errors else None
 
             row["n_valid"] = n_valid
 
