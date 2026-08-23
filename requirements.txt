@@ -8,3 +8,4 @@ cryptography
 boto3
 rich
 python-dotenv
+nest_asyncio

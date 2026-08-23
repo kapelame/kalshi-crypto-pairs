@@ -48,6 +48,23 @@ See [PHASE2_STREAMING.md](PHASE2_STREAMING.md) for the event schema, credentials
 timestamp guarantees, channels, and recovery behavior. Neither command imports
 or invokes the trading client.
 
+### Phase 3 deterministic research features
+
+Phase 3 replays immutable raw events into a separate append-only feature store.
+It provides causal probability, acceleration, breadth, dispersion, book/trade,
+target-distance, prior-window, and reset-regime measurements without models or
+trading decisions.
+
+```bash
+.venv/bin/python replay_stream.py --db kalshi_stream_raw.db --speed 0
+.venv/bin/python monitor_signals.py --db kalshi_stream_raw.db
+.venv/bin/python export_checkpoints.py --features-db kalshi_features_v3.db
+.venv/bin/python research_summary.py --features-db kalshi_features_v3.db
+```
+
+See [PHASE3_SIGNALS.md](PHASE3_SIGNALS.md) for formulas, thresholds, replay
+ordering, derived schema, and structural leakage guards.
+
 ### 3. Check data quality
 
 ```bash
@@ -167,6 +184,10 @@ Use this data with `train.py` to build and evaluate models before collecting you
 | `dashboard.py` | Terminal dashboard — live markets, positions, trade history. |
 | `collect_stream.py` | Read-only five-asset WebSocket/REST raw-event recorder. |
 | `diagnose_stream.py` | Time-limited streaming health and latency diagnostic. |
+| `replay_stream.py` | Deterministic raw-event replay into derived features. |
+| `monitor_signals.py` | Read-only five-asset research signal monitor. |
+| `export_checkpoints.py` | Frozen checkpoint export with post-freeze outcomes. |
+| `research_summary.py` | Descriptive completed-window statistics. |
 
 ## Fee Model
 
