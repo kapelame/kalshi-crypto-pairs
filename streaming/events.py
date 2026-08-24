@@ -38,6 +38,7 @@ class RawEvent:
     contract_close_time: str | None = None
     target: float | None = None
     sequence: int | None = None
+    sequence_generation: int | None = None
     event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
     def payload_json(self):
@@ -117,7 +118,8 @@ def parse_orderbook_delta(payload):
             "delta_fp": _decimal_string(msg.get("delta_fp"), "delta_fp", signed=True)}
 
 
-def make_ws_event(payload, asset, series_ticker, market=None, received_at=None):
+def make_ws_event(payload, asset, series_ticker, market=None, received_at=None,
+                  sequence_generation=None):
     event_type = payload.get("type")
     if event_type not in EVENT_TABLES:
         raise StreamSchemaError(f"unsupported event type: {event_type}")
@@ -132,4 +134,5 @@ def make_ws_event(payload, asset, series_ticker, market=None, received_at=None):
         source="kalshi_websocket", raw_payload=payload,
         contract_open_time=market.get("open_time"),
         contract_close_time=market.get("close_time"),
-        target=market.get("floor_strike"), sequence=payload.get("seq"))
+        target=market.get("floor_strike"), sequence=payload.get("seq"),
+        sequence_generation=sequence_generation)

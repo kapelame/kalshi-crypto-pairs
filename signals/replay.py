@@ -29,9 +29,13 @@ class RawEventReader:
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
             if not present:
                 continue
+            columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+            generation = ("sequence_generation" if "sequence_generation" in columns
+                          else "NULL AS sequence_generation")
             query = (f"SELECT rowid,event_id,event_type,asset,market_ticker,series_ticker,"
                      f"exchange_timestamp,local_receive_timestamp,processing_timestamp,source,"
-                     f"raw_payload,contract_open_time,contract_close_time,target,sequence FROM {table}")
+                     f"raw_payload,contract_open_time,contract_close_time,target,sequence,"
+                     f"{generation} FROM {table}")
             params = []
             if market_ticker:
                 query += " WHERE market_ticker=?"; params.append(market_ticker)
@@ -39,7 +43,8 @@ class RawEventReader:
                 event = dict(zip(("_rowid", "event_id", "event_type", "asset", "market_ticker",
                     "series_ticker", "exchange_timestamp", "local_receive_timestamp",
                     "processing_timestamp", "source", "raw_payload", "contract_open_time",
-                    "contract_close_time", "target", "sequence"), row))
+                    "contract_close_time", "target", "sequence",
+                    "sequence_generation"), row))
                 event["raw_payload"] = json.loads(event["raw_payload"])
                 event["_priority"] = priority
                 if stop_timestamp and parse_timestamp(event["local_receive_timestamp"]) > parse_timestamp(stop_timestamp):

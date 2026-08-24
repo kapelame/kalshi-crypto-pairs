@@ -20,7 +20,8 @@ COMMON_COLUMNS = """
     contract_open_time TEXT,
     contract_close_time TEXT,
     target REAL,
-    sequence INTEGER
+    sequence INTEGER,
+    sequence_generation INTEGER
 """
 
 
@@ -35,6 +36,11 @@ class RawEventStore:
         self.connection.execute("PRAGMA synchronous=NORMAL")
         for table in sorted(set(EVENT_TABLES.values())):
             self.connection.execute(f"CREATE TABLE IF NOT EXISTS {table} ({COMMON_COLUMNS})")
+            columns = {row[1] for row in self.connection.execute(
+                f"PRAGMA table_info({table})")}
+            if "sequence_generation" not in columns:
+                self.connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN sequence_generation INTEGER")
             self.connection.execute(
                 f"CREATE INDEX IF NOT EXISTS idx_{table}_ticker_time "
                 f"ON {table}(market_ticker, local_receive_timestamp)")
@@ -63,6 +69,7 @@ class RawEventStore:
             event.local_receive_timestamp, event.processing_timestamp,
             event.source, event.payload_json(), event.contract_open_time,
             event.contract_close_time, event.target, event.sequence,
+            event.sequence_generation,
         )
         self.connection.execute(
             f"INSERT INTO {table} VALUES ({','.join('?' for _ in values)})", values)

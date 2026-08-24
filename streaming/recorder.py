@@ -112,7 +112,8 @@ class StreamRecorder:
     async def on_ws_state(self, connected):
         self.health.set_connected(connected)
 
-    async def on_ws_message(self, payload, received_at, sequence_healthy):
+    async def on_ws_message(self, payload, received_at, sequence_healthy,
+                            sequence_generation=None):
         kind = payload.get("type")
         if kind in ("subscribed", "ok"):
             return
@@ -132,7 +133,7 @@ class StreamRecorder:
             if kind in ("ticker", "trade", "orderbook_snapshot", "orderbook_delta"):
                 self.health.update_ws(payload, received_at, sequence_healthy)
                 event = make_ws_event(payload, asset, ASSET_SERIES[asset], market,
-                                      received_at)
+                                      received_at, sequence_generation)
             elif kind in LIFECYCLE_TYPES:
                 record = self.health.apply_lifecycle(asset, ticker, payload, received_at)
                 market = record.as_market()
@@ -146,23 +147,25 @@ class StreamRecorder:
                     processing_timestamp=iso_utc(), source="kalshi_websocket",
                     raw_payload=payload, contract_open_time=market.get("open_time"),
                     contract_close_time=market.get("close_time"),
-                    target=market.get("floor_strike"), sequence=payload.get("seq"))
+                    target=market.get("floor_strike"), sequence=payload.get("seq"),
+                    sequence_generation=sequence_generation)
             else:
                 return
             self._append(event)
-            if not sequence_healthy and kind in ("orderbook_snapshot", "orderbook_delta"):
-                raw_book, book = await self.rest.orderbook(ticker)
-                recovered_at = iso_utc()
-                self.health.seed_market(asset, market, book, recovered_at)
-                self.health.assets[asset].sequence_healthy = False
-                self._append(RawEvent(
-                    event_type="orderbook_snapshot", asset=asset,
-                    market_ticker=ticker, series_ticker=ASSET_SERIES[asset],
-                    exchange_timestamp=None, local_receive_timestamp=recovered_at,
-                    processing_timestamp=iso_utc(), source="kalshi_rest_recovery",
-                    raw_payload=raw_book, contract_open_time=market.get("open_time"),
-                    contract_close_time=market.get("close_time"),
-                    target=market.get("floor_strike")))
+            if not sequence_healthy:
+                if kind in ("orderbook_snapshot", "orderbook_delta"):
+                    raw_book, book = await self.rest.orderbook(ticker)
+                    recovered_at = iso_utc()
+                    self.health.seed_market(asset, market, book, recovered_at)
+                    self.health.assets[asset].sequence_healthy = False
+                    self._append(RawEvent(
+                        event_type="orderbook_snapshot", asset=asset,
+                        market_ticker=ticker, series_ticker=ASSET_SERIES[asset],
+                        exchange_timestamp=None, local_receive_timestamp=recovered_at,
+                        processing_timestamp=iso_utc(), source="kalshi_rest_recovery",
+                        raw_payload=raw_book, contract_open_time=market.get("open_time"),
+                        contract_close_time=market.get("close_time"),
+                        target=market.get("floor_strike")))
                 if self.ws:
                     await self.ws.request_reconnect(b"sequence gap")
         except StreamSchemaError as exc:

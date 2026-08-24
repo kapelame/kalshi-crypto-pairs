@@ -99,6 +99,33 @@ class AuthAndConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(validator.observe(2, 13))
         self.assertEqual(validator.gaps, 1)
 
+    def test_sequences_are_generation_and_channel_scoped(self):
+        validator = SequenceValidator()
+        validator.begin_generation(1)
+        self.assertTrue(validator.observe(2, 1, "orderbook", 1))
+        self.assertTrue(validator.observe(3, 1, "trade", 1))
+        self.assertTrue(validator.observe(2, 2, "orderbook", 1))
+        self.assertFalse(validator.observe(2, 4, "orderbook", 1))
+        validator.begin_generation(2)
+        self.assertTrue(validator.observe(2, 1, "orderbook", 2))
+        self.assertTrue(validator.observe(3, 1, "trade", 2))
+        self.assertEqual(validator.gaps, 1)
+
+    def test_same_sid_reuse_after_reconnect_starts_cleanly(self):
+        validator = SequenceValidator()
+        validator.begin_generation(7)
+        self.assertTrue(validator.observe(2, 99, "orderbook", 7))
+        validator.begin_generation(8)
+        self.assertTrue(validator.observe(2, 1, "orderbook", 8))
+
+    def test_legacy_book_bootstrap_rotates_even_when_sid_changes(self):
+        validator = SequenceValidator()
+        self.assertTrue(validator.observe(9, 50, "trade"))
+        result = validator.observe_result(2, 1, "orderbook", bootstrap=True)
+        self.assertTrue(result.healthy)
+        self.assertTrue(result.generation_changed)
+        self.assertTrue(validator.observe(3, 1, "trade"))
+
     async def test_resubscribe_builds_same_read_only_commands(self):
         class FakeSocket:
             def __init__(self): self.sent = []
@@ -167,6 +194,21 @@ class StoreRolloverHealthTests(unittest.TestCase):
                     store.append(event)
                 with self.assertRaises(sqlite3.IntegrityError):
                     store.connection.execute("DELETE FROM ticker_events")
+
+    def test_raw_store_preserves_sequence_generation_and_migrates_legacy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "raw.db"
+            connection = sqlite3.connect(path)
+            connection.execute("CREATE TABLE ticker_events (" +
+                               __import__("streaming.raw_store", fromlist=["COMMON_COLUMNS"])
+                               .COMMON_COLUMNS.replace(",\n    sequence_generation INTEGER", "") + ")")
+            connection.commit(); connection.close()
+            with RawEventStore(path) as store:
+                event = RawEvent("ticker", "BTC", "T", "test", {},
+                                 sequence=1, sequence_generation=4)
+                store.append(event)
+                self.assertEqual(store.connection.execute(
+                    "SELECT sequence_generation FROM ticker_events").fetchone()[0], 4)
 
     def test_contract_rollover_event(self):
         old = {"ticker": "OLD", "open_time": "2026-08-23T19:30:00Z"}

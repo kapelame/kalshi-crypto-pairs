@@ -222,6 +222,48 @@ class ReplayLeakageTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(stopped), 2)
             self.assertAlmostEqual(stopped[-1]["features"]["midpoint_up_probability"], .6)
 
+    async def test_live_and_replay_sequence_generation_equivalence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sequence.db"
+            base = ticker("BTC", 0, .6)
+            raw_events = [
+                RawEvent("ticker", "BTC", "T", "kalshi_websocket",
+                         {**base["raw_payload"], "sid": 1, "seq": 1},
+                         local_receive_timestamp=iso(0), processing_timestamp=iso(0),
+                         contract_open_time=iso(0), contract_close_time=iso(900),
+                         target=100, sequence=1, sequence_generation=1, event_id="q"),
+                RawEvent("orderbook_snapshot", "BTC", "T", "kalshi_websocket",
+                         {"type": "orderbook_snapshot", "sid": 2, "seq": 1,
+                          "msg": {"market_ticker": "T", "yes_dollars_fp": [],
+                                  "no_dollars_fp": []}},
+                         local_receive_timestamp=iso(1), processing_timestamp=iso(1),
+                         contract_open_time=iso(0), contract_close_time=iso(900),
+                         target=100, sequence=1, sequence_generation=1, event_id="b1"),
+                RawEvent("orderbook_snapshot", "BTC", "T", "kalshi_websocket",
+                         {"type": "orderbook_snapshot", "sid": 2, "seq": 1,
+                          "msg": {"market_ticker": "T", "yes_dollars_fp": [],
+                                  "no_dollars_fp": []}},
+                         local_receive_timestamp=iso(2), processing_timestamp=iso(2),
+                         contract_open_time=iso(0), contract_close_time=iso(900),
+                         target=100, sequence=1, sequence_generation=2, event_id="b2"),
+                RawEvent("trade", "BTC", "T", "kalshi_websocket",
+                         {"type": "trade", "sid": 3, "seq": 1,
+                          "msg": {"market_ticker": "T", "yes_price_dollars": ".6",
+                                  "count_fp": "1"}},
+                         local_receive_timestamp=iso(3), processing_timestamp=iso(3),
+                         contract_open_time=iso(0), contract_close_time=iso(900),
+                         target=100, sequence=1, sequence_generation=2, event_id="t"),
+            ]
+            with RawEventStore(path) as store:
+                for item in raw_events:
+                    store.append(item)
+            replayed = await ReplayEngine(path).run(speed=0)
+            direct_engine = SignalEngine()
+            direct = [direct_engine.process(item.__dict__) for item in raw_events]
+            self.assertEqual(replayed, direct)
+            self.assertNotIn("SEQUENCE_UNHEALTHY",
+                             replayed[-1]["features"]["excluded_reasons"])
+
     async def test_settlement_joined_only_after_frozen_checkpoint(self):
         with tempfile.TemporaryDirectory() as directory:
             db = Path(directory)/"features.db"

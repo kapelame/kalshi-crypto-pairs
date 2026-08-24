@@ -182,21 +182,74 @@ class SignalCoherenceTests(unittest.TestCase):
     def test_sequence_gap_excludes_until_fresh_snapshot(self):
         engine = SignalEngine()
         first = quote("BTC", 0, "BTC")
-        first["raw_payload"].update({"sid": 7, "seq": 1})
         engine.process(first)
         snapshot_event = book("BTC", .1, "BTC")
-        snapshot_event["raw_payload"].update({"sid": 7, "seq": 2})
+        snapshot_event["raw_payload"].update({"sid": 2, "seq": 1})
         engine.process(snapshot_event)
-        gap = quote("BTC", 1, "BTC", .7)
-        gap["raw_payload"].update({"sid": 7, "seq": 4})
+        gap = raw("orderbook_delta", "BTC", 1, {"type": "orderbook_delta",
+                  "sid": 2, "seq": 3, "msg": {"market_ticker": "BTC",
+                  "side": "yes", "price_dollars": ".60", "delta_fp": "1"}},
+                  "BTC")
         broken = engine.process(gap)
         self.assertIn("SEQUENCE_UNHEALTHY",
                       broken["basket"]["excluded_reasons"]["BTC"])
         recovered = book("BTC", 1.1, "BTC")
-        recovered["raw_payload"].update({"sid": 7, "seq": 5})
+        recovered["raw_payload"].update({"sid": 2, "seq": 4})
         fixed = engine.process(recovered)
         self.assertNotIn("SEQUENCE_UNHEALTHY",
                          fixed["basket"]["excluded_reasons"].get("BTC", []))
+
+    def test_reconnect_book_and_trade_restarts_do_not_poison_sequence(self):
+        engine = SignalEngine()
+        for index, asset in enumerate(ASSET_SERIES, 1):
+            timestamp = .02 * index
+            engine.process(quote(asset, timestamp, asset))
+            initial = book(asset, timestamp + .01, asset)
+            initial["raw_payload"].update({"sid": 2, "seq": index})
+            initial["sequence_generation"] = 1
+            engine.process(initial)
+        self.assertEqual(engine.snapshot("BTC", .1, "before")["basket"]["eligible_count"], 5)
+
+        after = None
+        for index, asset in enumerate(ASSET_SERIES, 1):
+            bootstrap = book(asset, .2 + .01 * index, asset)
+            bootstrap["raw_payload"].update({"sid": 2, "seq": index})
+            bootstrap["sequence_generation"] = 2
+            after = engine.process(bootstrap)
+        trade = raw("trade", "BTC", .3, {"type": "trade", "sid": 3, "seq": 1,
+                    "msg": {"market_ticker": "BTC", "yes_price_dollars": ".70",
+                    "count_fp": "1"}}, "BTC")
+        trade["sequence_generation"] = 2
+        after = engine.process(trade)
+        self.assertEqual(after["basket"]["eligible_count"], 5)
+        self.assertNotIn("SEQUENCE_UNHEALTHY",
+                         after["basket"]["excluded_reasons"].get("BTC", []))
+
+    def test_trade_gap_requires_generation_recovery_not_same_generation_book(self):
+        engine = SignalEngine()
+        engine.process(quote("BTC", 0, "BTC"))
+        initial = book("BTC", .1, "BTC")
+        initial["raw_payload"].update({"sid": 2, "seq": 1})
+        initial["sequence_generation"] = 1
+        engine.process(initial)
+        for second, sequence in ((.2, 1), (.3, 3)):
+            trade = raw("trade", "BTC", second, {"type": "trade", "sid": 3,
+                        "seq": sequence, "msg": {"market_ticker": "BTC",
+                        "yes_price_dollars": ".7", "count_fp": "1"}}, "BTC")
+            trade["sequence_generation"] = 1
+            broken = engine.process(trade)
+        self.assertIn("SEQUENCE_UNHEALTHY", broken["features"]["excluded_reasons"])
+        same_generation = book("BTC", .4, "BTC")
+        same_generation["raw_payload"].update({"sid": 2, "seq": 2})
+        same_generation["sequence_generation"] = 1
+        still_broken = engine.process(same_generation)
+        self.assertIn("SEQUENCE_UNHEALTHY",
+                      still_broken["features"]["excluded_reasons"])
+        recovered = book("BTC", .5, "BTC")
+        recovered["raw_payload"].update({"sid": 2, "seq": 1})
+        recovered["sequence_generation"] = 2
+        fixed = engine.process(recovered)
+        self.assertNotIn("SEQUENCE_UNHEALTHY", fixed["features"]["excluded_reasons"])
 
     def test_530_forensic_regression(self):
         engine = SignalEngine()

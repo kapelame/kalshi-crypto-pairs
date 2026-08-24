@@ -98,6 +98,7 @@ Every table uses the same immutable raw envelope:
 | `contract_close_time` | Contract close timestamp |
 | `target` | Floor strike where applicable |
 | `sequence` | Exchange WebSocket sequence, nullable when absent |
+| `sequence_generation` | Local WebSocket connection/subscription generation, nullable for legacy captures |
 
 SQLite triggers reject UPDATE and DELETE on every raw table. Duplicate
 `event_id` inserts are rejected. Missing values remain SQL `NULL`/JSON `null`;
@@ -111,10 +112,23 @@ high-precision `time`, `ts_ms`, then `ts`. The receive-latency helper compares
 exchange time with local receipt; processing latency compares local receipt with
 processing time.
 
-Sequences are validated independently by subscription ID (`sid`). A gap is
-counted, marks the affected asset unhealthy, fetches a REST recovery book, and
-forces a reconnect/resubscribe so a new WebSocket snapshot establishes a fresh
-sequence.
+Sequence identity is `(connection generation, channel family, sid)`. Order-book
+snapshot and delta messages share the `orderbook` family; ticker, trade, and
+lifecycle channels remain independent. Sequence numbers are not assumed to be
+global across channels or connections. Each reconnect/resubscription increments
+`sequence_generation`, rotates prior expectations, and permits each new stream
+to bootstrap independently. Within one identity, any value other than the prior
+sequence plus one is a gap. A gap marks affected state unhealthy, fetches a REST
+recovery book, and forces a reconnect/resubscribe. A healthy fresh order-book
+snapshot in the new generation restores that market's sequence health.
+
+Legacy raw databases do not contain the generation column. During bounded
+replay, a sequence-1 order-book snapshot is treated as trusted evidence of a
+new subscription generation; a trade or ticker restart alone is never used to
+infer a generation boundary. Persisted lifecycle-v2 rows are not replay-
+validated because that subscription is global while the recorder intentionally
+retains only lifecycle events belonging to the five tracked markets; the live
+transport still validates the complete lifecycle stream before filtering.
 
 ## Contract resets
 

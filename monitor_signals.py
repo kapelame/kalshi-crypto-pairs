@@ -14,7 +14,7 @@ from signals.replay import TABLE_ORDER
 COLUMNS = ("_rowid", "event_id", "event_type", "asset", "market_ticker",
            "series_ticker", "exchange_timestamp", "local_receive_timestamp",
            "processing_timestamp", "source", "raw_payload", "contract_open_time",
-           "contract_close_time", "target", "sequence")
+           "contract_close_time", "target", "sequence", "sequence_generation")
 
 
 def fmt(value, signed=False):
@@ -43,10 +43,15 @@ class IncrementalRawTail:
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
                 if not present:
                     continue
+                columns = {row[1] for row in connection.execute(
+                    f"PRAGMA table_info({table})")}
+                generation = ("sequence_generation" if "sequence_generation" in columns
+                              else "NULL AS sequence_generation")
                 rows = connection.execute(
                     f"SELECT rowid,event_id,event_type,asset,market_ticker,series_ticker,"
                     f"exchange_timestamp,local_receive_timestamp,processing_timestamp,source,"
-                    f"raw_payload,contract_open_time,contract_close_time,target,sequence "
+                    f"raw_payload,contract_open_time,contract_close_time,target,sequence,"
+                    f"{generation} "
                     f"FROM {table} WHERE rowid>? ORDER BY rowid LIMIT ?",
                     (self.rowids[table], self.batch_size)).fetchall()
                 if rows:

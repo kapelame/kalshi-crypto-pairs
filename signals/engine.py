@@ -5,6 +5,7 @@ from copy import deepcopy
 
 from streaming import ASSET_SERIES
 from streaming.contracts import ContractRegistry, RolloverState, evaluate_eligibility
+from streaming.sequence import SequenceValidator, channel_family
 from streaming.timeutil import parse_timestamp
 
 from .config import SignalConfig
@@ -37,7 +38,8 @@ class SignalEngine:
         self.last_event_time = None
         self.event_count = 0
         self.registry = ContractRegistry()
-        self.sequences = {}
+        self.sequence = SequenceValidator()
+        self.sequence_problems = {asset: set() for asset in ASSET_SERIES}
 
     def process(self, event):
         """Consume one raw event mapping and return a frozen feature snapshot."""
@@ -53,11 +55,28 @@ class SignalEngine:
         payload = event.get("raw_payload") or {}
         kind = event["event_type"]
         sid, sequence = payload.get("sid"), payload.get("seq", event.get("sequence"))
-        if sid is not None and sequence is not None:
-            previous = self.sequences.get(sid)
-            if previous is not None and sequence != previous + 1:
-                state.sequence_healthy = False
-            self.sequences[sid] = sequence
+        # Lifecycle v2 is a global subscription, while the recorder retains
+        # only events resolvable to the five tracked tickers. Its persisted
+        # sequence is therefore intentionally sparse and cannot be replay-
+        # validated. Transport validation still sees the complete channel.
+        sequence_replayable = kind in {
+            "ticker", "trade", "orderbook_snapshot", "orderbook_delta"}
+        if sequence_replayable and sid is not None and sequence is not None:
+            observation = self.sequence.observe_result(
+                sid, sequence, channel_family(kind),
+                event.get("sequence_generation"),
+                bootstrap=kind == "orderbook_snapshot")
+            if observation.generation_changed:
+                for candidate_asset, candidate in self.assets.items():
+                    self.sequence_problems[candidate_asset].clear()
+                    self.sequence_problems[candidate_asset].add("bootstrap")
+                    candidate.sequence_healthy = False
+            if not observation.healthy:
+                affected = (self.assets if observation.family == "orderbook"
+                            else (asset,))
+                for candidate_asset in affected:
+                    self.sequence_problems[candidate_asset].add(observation.family)
+                    self.assets[candidate_asset].sequence_healthy = False
         # A reset must finalize the untouched old contract before installing new metadata.
         if kind == "contract_reset":
             self._reset(state, payload, event, timestamp)
@@ -71,7 +90,10 @@ class SignalEngine:
             self._underlying(state, payload, timestamp)
         elif kind == "orderbook_snapshot" and ticker_matches:
             self._book_snapshot(state, payload, event.get("source", ""), timestamp)
-            state.sequence_healthy = True
+            if sid is None or sequence is None or observation.healthy:
+                self.sequence_problems[asset].discard("bootstrap")
+                self.sequence_problems[asset].discard("orderbook")
+                state.sequence_healthy = not self.sequence_problems[asset]
         elif kind == "orderbook_delta" and ticker_matches:
             self._book_delta(state, payload, timestamp)
         elif kind == "trade" and ticker_matches:

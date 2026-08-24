@@ -7,30 +7,12 @@ import logging
 import aiohttp
 
 from .auth import auth_headers_from_environment
+from .sequence import SequenceValidator, channel_family
 from .timeutil import iso_utc
 
 
 LOGGER = logging.getLogger("kalshi.streaming.websocket")
 WS_URL = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
-
-
-class SequenceValidator:
-    def __init__(self):
-        self.last = {}
-        self.gaps = 0
-
-    def observe(self, sid, sequence):
-        if sid is None or sequence is None:
-            return True
-        previous = self.last.get(sid)
-        healthy = previous is None or sequence == previous + 1
-        if not healthy:
-            self.gaps += 1
-        self.last[sid] = sequence
-        return healthy
-
-    def reset(self):
-        self.last.clear()
 
 
 def subscription_messages(tickers, start_id=1):
@@ -75,6 +57,7 @@ class KalshiWebSocketClient:
 
     async def run_connection(self, ws):
         self.sequence.reset()
+        generation = self.sequence.generation
         await self._state(True)
         await self._subscribe(ws)
         try:
@@ -91,8 +74,10 @@ class KalshiWebSocketClient:
                     except json.JSONDecodeError:
                         LOGGER.error("discarding malformed WebSocket JSON")
                         continue
-                    healthy = self.sequence.observe(payload.get("sid"), payload.get("seq"))
-                    await self.on_message(payload, received_at, healthy)
+                    healthy = self.sequence.observe(
+                        payload.get("sid"), payload.get("seq"),
+                        channel_family(payload.get("type")), generation)
+                    await self.on_message(payload, received_at, healthy, generation)
                 elif message.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE,
                                       aiohttp.WSMsgType.ERROR):
                     raise ConnectionError(f"WebSocket closed: {message.type}")
