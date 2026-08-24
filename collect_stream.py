@@ -27,7 +27,7 @@ async def run(args):
         elapsed = time.monotonic() - started
         print("\nCollection summary")
         for key, value in recorder.summary(elapsed).items():
-            if key != "latencies_ms":
+            if not key.endswith("latencies_ms"):
                 print(f"{key}: {value}")
 
 

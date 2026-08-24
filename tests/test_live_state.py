@@ -118,7 +118,9 @@ class RecorderNormalizationTests(unittest.IsolatedAsyncioTestCase):
     async def test_old_lifecycle_normalized_from_old_ticker_registry(self):
         recorder = StreamRecorder()
         captured = []
-        recorder._append = captured.append
+        async def capture(event):
+            captured.append(event)
+        recorder._append = capture
         old = {"ticker": "ETH-OLD", "status": "active", "floor_strike": 2449.47,
                "open_time": iso(0), "close_time": iso(900), "yes_bid": 45,
                "yes_ask": 46, "no_bid": 54, "no_ask": 55, "volume": 1,
@@ -321,6 +323,7 @@ class MonitorTests(unittest.TestCase):
             output = format_monitor(monitor)
             self.assertIn("watermark=", output)
             self.assertIn("ELIGIBLE: 5/5", output)
+            monitor.close()
 
     @unittest.skipIf(os.name == "nt", "POSIX SIGINT test")
     def test_ctrl_c_shutdown_is_bounded(self):

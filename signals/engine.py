@@ -38,6 +38,7 @@ class SignalEngine:
         self.config = config or SignalConfig()
         self.assets = {asset: AssetState.create(asset, self.config) for asset in ASSET_SERIES}
         self.last_event_time = None
+        self.last_ingest_sequence = None
         self.event_count = 0
         self.registry = ContractRegistry()
         self.sequence = SequenceValidator()
@@ -45,10 +46,19 @@ class SignalEngine:
 
     def process(self, event, emit_snapshot=True):
         """Consume one raw event; optionally materialize its full frozen snapshot."""
+        ingest_sequence = event.get("_ingest_sequence")
         timestamp = parse_timestamp(event["local_receive_timestamp"]).timestamp()
-        if self.last_event_time is not None and timestamp < self.last_event_time:
+        if ingest_sequence is not None:
+            if (self.last_ingest_sequence is not None and
+                    ingest_sequence <= self.last_ingest_sequence):
+                raise ValueError("raw events are not in causal order")
+            self.last_ingest_sequence = ingest_sequence
+        elif self.last_event_time is not None and timestamp < self.last_event_time:
             raise ValueError("raw events are not in causal order")
-        self.last_event_time = timestamp
+        # Delivery order is the ingest sequence for new captures, while feature
+        # event time remains the preserved local observation-availability time.
+        self.last_event_time = (timestamp if self.last_event_time is None else
+                                max(self.last_event_time, timestamp))
         self.event_count += 1
         asset = event["asset"]
         if asset not in self.assets:

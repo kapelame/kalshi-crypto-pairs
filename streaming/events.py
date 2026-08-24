@@ -39,6 +39,7 @@ class RawEvent:
     target: float | None = None
     sequence: int | None = None
     sequence_generation: int | None = None
+    request_started_at: str | None = None
     event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
     def payload_json(self):

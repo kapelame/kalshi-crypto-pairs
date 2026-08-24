@@ -11,7 +11,8 @@ from datetime import timedelta
 
 from signals.engine import SignalEngine
 from signals.ordering import (TABLE_ORDER, event_from_row, event_order_key,
-                              generation_projection, select_columns)
+                              generation_projection, has_ingest_ledger,
+                              read_ingest_batch, select_columns, table_specs)
 from streaming.timeutil import parse_timestamp, utc_now
 
 
@@ -47,6 +48,9 @@ class IncrementalRawTail:
         self.caught_up = False
         self.connection = None
         self.table_specs = None
+        self.ingest_mode = False
+        self.latest_ingest_sequence = None
+        self.state_persistence_timestamp = None
 
     def _open(self):
         if self.connection is None:
@@ -63,6 +67,8 @@ class IncrementalRawTail:
                 generation = generation_projection(columns)
                 specs.append((priority, table, generation))
             self.table_specs = specs
+            self.ingest_mode = has_ingest_ledger(self.connection)
+            self.ingest_specs = table_specs(self.connection)
         return self.connection
 
     def _processing_frontier(self, connection):
@@ -84,6 +90,8 @@ class IncrementalRawTail:
 
     def read_batch(self, final=False):
         connection = self._open()
+        if self.ingest_mode:
+            return self._read_ingest_batch(connection)
         fetched, unseen_processing = [], []
         batch_constrained = False
         try:
@@ -149,6 +157,26 @@ class IncrementalRawTail:
         self.buffer_high_water = max(self.buffer_high_water, len(self.pending))
         return ready
 
+    def _read_ingest_batch(self, connection):
+        after = self.latest_ingest_sequence or 0
+        try:
+            connection.execute("BEGIN")
+            events = read_ingest_batch(
+                connection, after, self.batch_size, self.ingest_specs)
+            latest = connection.execute(
+                "SELECT COALESCE(MAX(ingest_sequence),0) FROM raw_ingest_log").fetchone()[0]
+            connection.rollback()
+        except Exception:
+            connection.rollback()
+            raise
+        if events:
+            self.latest_ingest_sequence = events[-1]["_ingest_sequence"]
+        self.events_read += len(events)
+        self.backlog = max(0, latest - (self.latest_ingest_sequence or 0))
+        self.pending.clear()
+        self.caught_up = len(events) < self.batch_size and self.backlog == 0
+        return events
+
     def drain(self):
         """Drain a database the caller has established is no longer being written."""
         output = []
@@ -177,6 +205,10 @@ class LiveSignalMonitor:
         self.processing_samples = deque(maxlen=10000)
         self.maximum_backlog = 0
         self.catch_up_lag_ms = None
+        self.latest_ingest_sequence = None
+        self.persist_to_engine_samples = deque(maxlen=10000)
+        self.last_engine_wall_timestamp = None
+        self.render_lag_ms = None
 
     def consume_once(self):
         events = self.tail.read_batch()
@@ -186,17 +218,25 @@ class LiveSignalMonitor:
     def _consume(self, events):
         for event in events:
             started = time.perf_counter()
+            engine_wall = time.time()
             self.engine.process(event, emit_snapshot=False)
             self.processing_samples.append((time.perf_counter() - started) * 1000)
             self.state_timestamp = event["local_receive_timestamp"]
             self.raw_watermark = event["event_id"]
+            self.latest_ingest_sequence = event.get("_ingest_sequence")
+            persisted = event.get("_persistence_timestamp")
+            if persisted:
+                self.state_persistence_timestamp = persisted
+                self.persist_to_engine_samples.append(max(
+                    0.0, (engine_wall - parse_timestamp(persisted).timestamp()) * 1000))
+            self.last_engine_wall_timestamp = engine_wall
             self.events_processed += 1
         self.caught_up = self.tail.caught_up
         self.maximum_backlog = max(self.maximum_backlog, self.tail.backlog)
         if self.state_timestamp:
-            from streaming.timeutil import parse_timestamp
+            state_basis = self.state_persistence_timestamp or self.state_timestamp
             self.catch_up_lag_ms = max(0.0, (time.time() -
-                parse_timestamp(self.state_timestamp).timestamp()) * 1000)
+                parse_timestamp(state_basis).timestamp()) * 1000)
 
     async def consume_once_async(self):
         events = await asyncio.to_thread(self.tail.read_batch)
@@ -229,16 +269,32 @@ def format_monitor(monitor):
     elapsed = max(time.monotonic() - monitor.started_at, 1e-9)
     rate = monitor.events_processed / elapsed
     samples = sorted(monitor.processing_samples)
+    persist_samples = sorted(monitor.persist_to_engine_samples)
     def percentile(fraction):
         return None if not samples else samples[min(len(samples)-1, int(len(samples)*fraction))]
+    def persist_percentile(fraction):
+        return (None if not persist_samples else
+                persist_samples[min(len(persist_samples)-1,
+                                    int(len(persist_samples)*fraction))])
+    monitor.render_lag_ms = (None if monitor.last_engine_wall_timestamp is None else
+                             max(0.0, (time.time() -
+                                      monitor.last_engine_wall_timestamp) * 1000))
     lines = [f"STATE timestamp={monitor.state_timestamp or '---'} "
-             f"watermark={monitor.raw_watermark or '---'} caught_up={'yes' if monitor.caught_up else 'no'}",
+             f"watermark={monitor.raw_watermark or '---'} "
+             f"ingest_sequence={monitor.latest_ingest_sequence or '---'} "
+             f"caught_up={'yes' if monitor.caught_up else 'no'}",
              f"FLOW processed={monitor.events_processed} rate={rate:.0f}/s "
-             f"backlog={monitor.tail.backlog} max_backlog={monitor.maximum_backlog} "
+             f"source_backlog={monitor.tail.backlog} "
+             f"processing_backlog={monitor.tail.backlog + len(monitor.tail.pending)} "
+             f"max_backlog={monitor.maximum_backlog} "
              f"reorder_buffer={len(monitor.tail.pending)} "
              f"buffer_hwm={monitor.tail.buffer_high_water} "
-             f"lag_ms={fmt(monitor.catch_up_lag_ms)} proc_ms_p50={fmt(percentile(.50))} "
-             f"p95={fmt(percentile(.95))} p99={fmt(percentile(.99))}",
+             f"state_lag_ms={fmt(monitor.catch_up_lag_ms)} "
+             f"render_lag_ms={fmt(monitor.render_lag_ms)} "
+             f"persist_engine_p50={fmt(persist_percentile(.50))} "
+             f"p95={fmt(persist_percentile(.95))} p99={fmt(persist_percentile(.99))} "
+             f"proc_ms_p50={fmt(percentile(.50))} proc_p95={fmt(percentile(.95))} "
+             f"proc_p99={fmt(percentile(.99))}",
              "ASSET TICKER WINDOW STATUS TARGET Q_AGE B_AGE ROLLOVER ELIGIBLE REASONS"]
     for asset in ("BTC", "ETH", "SOL", "XRP", "DOGE"):
         snapshot = snapshots.get(asset)
@@ -266,9 +322,12 @@ def render(source):
     if isinstance(source, LiveSignalMonitor):
         return format_monitor(source)
     monitor = LiveSignalMonitor(source, batch_size=1000)
-    while monitor.consume_once():
-        pass
-    return format_monitor(monitor)
+    try:
+        while monitor.consume_once():
+            pass
+        return format_monitor(monitor)
+    finally:
+        monitor.close()
 
 
 async def run(args):

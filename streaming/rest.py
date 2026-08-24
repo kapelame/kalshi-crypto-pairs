@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from dataclasses import dataclass
 from urllib.parse import quote
 
 import aiohttp
@@ -15,6 +16,13 @@ from .timeutil import iso_utc
 
 REST_BASE = "https://external-api.kalshi.com/trade-api/v2"
 COINBASE_URL = "https://api.coinbase.com/v2/exchange-rates?currency=USD"
+
+
+@dataclass(frozen=True)
+class HttpObservation:
+    value: object
+    request_started_at: str
+    response_received_at: str
 
 
 class RestDataClient:
@@ -36,20 +44,31 @@ class RestDataClient:
     async def _get(self, path):
         if self.session is None:
             await self.open()
+        request_started_at = iso_utc()
         async with self.session.get(f"{REST_BASE}{path}") as response:
             body = await response.text()
+            response_received_at = iso_utc()
             if response.status != 200:
                 raise RuntimeError(f"Kalshi REST HTTP {response.status}: {body[:300]}")
             try:
-                return json.loads(body)
+                payload = json.loads(body)
             except json.JSONDecodeError as exc:
                 raise RuntimeError("Kalshi REST returned malformed JSON") from exc
+        return HttpObservation(payload, request_started_at, response_received_at)
 
-    async def discover_asset(self, asset):
+    @staticmethod
+    def _timed(value):
+        """Compatibility for injected test clients overriding the old _get API."""
+        if isinstance(value, HttpObservation):
+            return value
+        now = iso_utc()
+        return HttpObservation(value, now, now)
+
+    async def discover_asset(self, asset, timed=False):
         series = ASSET_SERIES[asset]
-        payload = await self._get(
-            f"/markets?series_ticker={quote(series)}&status=open&limit=1")
-        markets = parse_markets_response(payload)
+        observation = self._timed(await self._get(
+            f"/markets?series_ticker={quote(series)}&status=open&limit=1"))
+        markets = parse_markets_response(observation.value)
         if not markets:
             raise RuntimeError(f"no open market for {asset} ({series})")
         market = markets[0]
@@ -57,25 +76,35 @@ class RestDataClient:
             raise RuntimeError(
                 f"discovery returned non-active market for {asset}: "
                 f"{market.get('ticker')} status={market.get('status')}")
-        return market
+        result = HttpObservation(market, observation.request_started_at,
+                                 observation.response_received_at)
+        return result if timed else market
 
-    async def discover_all(self):
+    async def discover_all(self, timed=False):
         results = await asyncio.gather(
-            *(self.discover_asset(asset) for asset in ASSET_SERIES))
+            *(self.discover_asset(asset, timed=timed) for asset in ASSET_SERIES))
         return dict(zip(ASSET_SERIES, results))
 
-    async def market(self, ticker):
-        payload = await self._get(f"/markets/{quote(ticker)}")
-        return parse_market(payload.get("market"))
+    async def market(self, ticker, timed=False):
+        observation = self._timed(await self._get(f"/markets/{quote(ticker)}"))
+        market = parse_market(observation.value.get("market"))
+        result = HttpObservation(market, observation.request_started_at,
+                                 observation.response_received_at)
+        return result if timed else market
 
-    async def orderbook(self, ticker, depth=100):
-        payload = await self._get(f"/markets/{quote(ticker)}/orderbook?depth={depth}")
-        return payload, parse_orderbook_response(payload)
+    async def orderbook(self, ticker, depth=100, timed=False):
+        observation = self._timed(await self._get(
+            f"/markets/{quote(ticker)}/orderbook?depth={depth}"))
+        value = (observation.value, parse_orderbook_response(observation.value))
+        result = HttpObservation(value, observation.request_started_at,
+                                 observation.response_received_at)
+        return result if timed else value
 
     async def underlying_events(self, markets):
-        received = iso_utc()
+        request_started_at = iso_utc()
         async with self.session.get(COINBASE_URL) as response:
             body = await response.text()
+            received = iso_utc()
             if response.status != 200:
                 raise RuntimeError(f"Coinbase HTTP {response.status}: {body[:300]}")
             payload = json.loads(body)
@@ -93,5 +122,6 @@ class RestDataClient:
                 processing_timestamp=iso_utc(), source="coinbase_rest",
                 raw_payload=raw, contract_open_time=market.get("open_time"),
                 contract_close_time=market.get("close_time"),
-                target=market.get("floor_strike")))
+                target=market.get("floor_strike"),
+                request_started_at=request_started_at))
         return events

@@ -7,10 +7,12 @@ from collections import Counter
 from . import ASSET_SERIES
 from .events import RawEvent, StreamSchemaError, make_ws_event
 from .contracts import ContractRegistry
+from .dispatcher import CausalIngestDispatcher, LiveSignalService
 from .health import HealthMonitor
 from .raw_store import RawEventStore
 from .rest import RestDataClient
-from .timeutil import exchange_timestamp, iso_utc, receive_latency_ms
+from .timeutil import (exchange_timestamp, iso_utc, persistence_latency_ms,
+                       receive_latency_ms, request_latency_ms)
 from .websocket import KalshiWebSocketClient
 
 
@@ -22,7 +24,8 @@ LIFECYCLE_TYPES = {
 }
 
 
-def build_reset_event(asset, old_market, new_market, prior_final, received_at=None):
+def build_reset_event(asset, old_market, new_market, prior_final, received_at=None,
+                      request_started_at=None):
     received = received_at or iso_utc()
     payload = {
         "previous_ticker": old_market["ticker"],
@@ -42,12 +45,14 @@ def build_reset_event(asset, old_market, new_market, prior_final, received_at=No
         source="kalshi_rest_rollover", raw_payload=payload,
         contract_open_time=new_market.get("open_time"),
         contract_close_time=new_market.get("close_time"),
-        target=new_market.get("floor_strike"))
+        target=new_market.get("floor_strike"),
+        request_started_at=request_started_at)
 
 
 class StreamRecorder:
     def __init__(self, db_path="kalshi_stream_raw.db", discovery_seconds=5,
-                 underlying_seconds=2, dotenv_path=".env"):
+                 underlying_seconds=2, dotenv_path=".env", live_service=None,
+                 dispatcher_queue_size=100_000):
         self.store = RawEventStore(db_path)
         self.rest = RestDataClient()
         self.registry = ContractRegistry()
@@ -61,18 +66,33 @@ class StreamRecorder:
         self.counts_by_type = Counter()
         self.counts_by_asset = Counter()
         self.receive_latencies = []
+        self.request_latencies = []
+        self.persistence_latencies = []
         self.stale_markets = set()
+        self.live_service = live_service or LiveSignalService()
+        self.dispatcher = CausalIngestDispatcher(
+            self.store, self.live_service, max_queue=dispatcher_queue_size,
+            unhealthy_threshold=max(1, dispatcher_queue_size // 2))
 
-    def _append(self, event):
-        self.store.append(event)
+    async def _append(self, event):
+        envelope = await self.dispatcher.publish(event)
+        persisted_timestamp = envelope.event["_persistence_timestamp"]
         self.counts_by_type[event.event_type] += 1
         self.counts_by_asset[event.asset] += 1
         latency = receive_latency_ms(event)
         if latency is not None:
             self.receive_latencies.append(latency)
+        request_latency = request_latency_ms(event)
+        if request_latency is not None:
+            self.request_latencies.append(request_latency)
+        persistence_latency = persistence_latency_ms(
+            event, persisted_timestamp)
+        if persistence_latency is not None:
+            self.persistence_latencies.append(persistence_latency)
+        return envelope
 
-    def _append_rest_ticker(self, asset, market, received):
-        self._append(RawEvent(
+    async def _append_rest_ticker(self, asset, market, received, request_started_at=None):
+        await self._append(RawEvent(
             event_type="ticker", asset=asset, market_ticker=market["ticker"],
             series_ticker=ASSET_SERIES[asset],
             exchange_timestamp=market.get("updated_time"),
@@ -80,34 +100,46 @@ class StreamRecorder:
             source="kalshi_rest_snapshot", raw_payload=market,
             contract_open_time=market.get("open_time"),
             contract_close_time=market.get("close_time"),
-            target=market.get("floor_strike")))
+            target=market.get("floor_strike"),
+            request_started_at=request_started_at))
 
     async def bootstrap(self):
         self.store.open()
+        await self.dispatcher.start(catch_up=True)
         await self.rest.open()
-        self.markets = await self.rest.discover_all()
+        discoveries = await self.rest.discover_all(timed=True)
+        self.markets = {asset: observation.value
+                        for asset, observation in discoveries.items()}
         for asset, market in self.markets.items():
-            received = iso_utc()
-            raw_book, book = await self.rest.orderbook(market["ticker"])
-            self.health.seed_market(asset, market, book, received)
-            self._append_rest_ticker(asset, market, received)
-            self._append(RawEvent(
+            discovery = discoveries[asset]
+            book_observation = await self.rest.orderbook(market["ticker"], timed=True)
+            raw_book, book = book_observation.value
+            self.health.seed_market(
+                asset, market, book, book_observation.response_received_at)
+            await self._append_rest_ticker(
+                asset, market, discovery.response_received_at,
+                discovery.request_started_at)
+            await self._append(RawEvent(
                 event_type="market_lifecycle", asset=asset,
                 market_ticker=market["ticker"], series_ticker=ASSET_SERIES[asset],
                 exchange_timestamp=market.get("updated_time"),
-                local_receive_timestamp=received, processing_timestamp=iso_utc(),
+                local_receive_timestamp=discovery.response_received_at,
+                processing_timestamp=iso_utc(),
                 source="kalshi_rest_discovery", raw_payload=market,
                 contract_open_time=market.get("open_time"),
                 contract_close_time=market.get("close_time"),
-                target=market.get("floor_strike")))
-            self._append(RawEvent(
+                target=market.get("floor_strike"),
+                request_started_at=discovery.request_started_at))
+            await self._append(RawEvent(
                 event_type="orderbook_snapshot", asset=asset,
                 market_ticker=market["ticker"], series_ticker=ASSET_SERIES[asset],
-                exchange_timestamp=None, local_receive_timestamp=received,
+                exchange_timestamp=None,
+                local_receive_timestamp=book_observation.response_received_at,
                 processing_timestamp=iso_utc(), source="kalshi_rest_recovery",
                 raw_payload=raw_book, contract_open_time=market.get("open_time"),
                 contract_close_time=market.get("close_time"),
-                target=market.get("floor_strike")))
+                target=market.get("floor_strike"),
+                request_started_at=book_observation.request_started_at))
 
     async def on_ws_state(self, connected):
         self.health.set_connected(connected)
@@ -151,21 +183,23 @@ class StreamRecorder:
                     sequence_generation=sequence_generation)
             else:
                 return
-            self._append(event)
+            await self._append(event)
             if not sequence_healthy:
                 if kind in ("orderbook_snapshot", "orderbook_delta"):
-                    raw_book, book = await self.rest.orderbook(ticker)
-                    recovered_at = iso_utc()
+                    book_observation = await self.rest.orderbook(ticker, timed=True)
+                    raw_book, book = book_observation.value
+                    recovered_at = book_observation.response_received_at
                     self.health.seed_market(asset, market, book, recovered_at)
                     self.health.assets[asset].sequence_healthy = False
-                    self._append(RawEvent(
+                    await self._append(RawEvent(
                         event_type="orderbook_snapshot", asset=asset,
                         market_ticker=ticker, series_ticker=ASSET_SERIES[asset],
                         exchange_timestamp=None, local_receive_timestamp=recovered_at,
                         processing_timestamp=iso_utc(), source="kalshi_rest_recovery",
                         raw_payload=raw_book, contract_open_time=market.get("open_time"),
                         contract_close_time=market.get("close_time"),
-                        target=market.get("floor_strike")))
+                        target=market.get("floor_strike"),
+                        request_started_at=book_observation.request_started_at))
                 if self.ws:
                     await self.ws.request_reconnect(b"sequence gap")
         except StreamSchemaError as exc:
@@ -178,14 +212,15 @@ class StreamRecorder:
                 changed = False
                 for asset in ASSET_SERIES:
                     try:
-                        new_market = await self.rest.discover_asset(asset)
+                        discovery = await self.rest.discover_asset(asset, timed=True)
+                        new_market = discovery.value
                     except Exception as exc:
                         LOGGER.warning("REST rollover discovery pending for %s: %s", asset, exc)
                         continue
                     old = self.markets[asset]
                     if old["ticker"] == new_market["ticker"]:
                         # Same ticker metadata can improve after activation (notably target).
-                        received = iso_utc()
+                        received = discovery.response_received_at
                         self.registry.update(asset, new_market["ticker"], new_market,
                                              source="kalshi_rest_discovery", timestamp=received)
                         self.health.refresh_market_metadata(asset, new_market, received)
@@ -195,27 +230,36 @@ class StreamRecorder:
                         continue
                     changed = True
                     try:
-                        prior_final = await self.rest.market(old["ticker"])
+                        prior_observation = await self.rest.market(old["ticker"], timed=True)
+                        prior_final = prior_observation.value
+                        reset_received = prior_observation.response_received_at
                     except Exception as exc:
                         LOGGER.warning("prior settlement lookup failed for %s: %s",
                                        old["ticker"], exc)
                         prior_final = None
-                    received = iso_utc()
-                    self._append(build_reset_event(
-                        asset, old, new_market, prior_final, received))
-                    raw_book, book = await self.rest.orderbook(new_market["ticker"])
-                    self.health.seed_market(asset, new_market, book, received)
-                    self._append_rest_ticker(asset, new_market, received)
-                    self._append(RawEvent(
+                        reset_received = iso_utc()
+                    await self._append(build_reset_event(
+                        asset, old, new_market, prior_final, reset_received,
+                        discovery.request_started_at))
+                    book_observation = await self.rest.orderbook(
+                        new_market["ticker"], timed=True)
+                    raw_book, book = book_observation.value
+                    self.health.seed_market(
+                        asset, new_market, book, book_observation.response_received_at)
+                    await self._append_rest_ticker(
+                        asset, new_market, discovery.response_received_at,
+                        discovery.request_started_at)
+                    await self._append(RawEvent(
                         event_type="orderbook_snapshot", asset=asset,
                         market_ticker=new_market["ticker"],
                         series_ticker=ASSET_SERIES[asset], exchange_timestamp=None,
-                        local_receive_timestamp=received,
+                        local_receive_timestamp=book_observation.response_received_at,
                         processing_timestamp=iso_utc(), source="kalshi_rest_recovery",
                         raw_payload=raw_book,
                         contract_open_time=new_market.get("open_time"),
                         contract_close_time=new_market.get("close_time"),
-                        target=new_market.get("floor_strike")))
+                        target=new_market.get("floor_strike"),
+                        request_started_at=book_observation.request_started_at))
                     self.markets[asset] = new_market
                 if changed and self.ws:
                     await self.ws.replace_tickers(
@@ -227,7 +271,7 @@ class StreamRecorder:
         while not self.stop_event.is_set():
             try:
                 for event in await self.rest.underlying_events(self.markets):
-                    self._append(event)
+                    await self._append(event)
             except Exception:
                 LOGGER.exception("underlying reference-price poll failed")
             await asyncio.sleep(self.underlying_seconds)
@@ -240,14 +284,19 @@ class StreamRecorder:
                 if age is None or age <= 30_000:
                     continue
                 try:
-                    market = await self.rest.discover_asset(asset)
+                    discovery = await self.rest.discover_asset(asset, timed=True)
+                    market = discovery.value
                     if market["ticker"] != self.markets[asset]["ticker"]:
                         continue  # discovery_loop owns rollover/reset ordering
-                    raw_book, book = await self.rest.orderbook(market["ticker"])
-                    received = iso_utc()
+                    book_observation = await self.rest.orderbook(
+                        market["ticker"], timed=True)
+                    raw_book, book = book_observation.value
+                    received = book_observation.response_received_at
                     self.health.seed_market(asset, market, book, received)
-                    self._append_rest_ticker(asset, market, received)
-                    self._append(RawEvent(
+                    await self._append_rest_ticker(
+                        asset, market, discovery.response_received_at,
+                        discovery.request_started_at)
+                    await self._append(RawEvent(
                         event_type="orderbook_snapshot", asset=asset,
                         market_ticker=market["ticker"],
                         series_ticker=ASSET_SERIES[asset], exchange_timestamp=None,
@@ -256,7 +305,8 @@ class StreamRecorder:
                         raw_payload=raw_book,
                         contract_open_time=market.get("open_time"),
                         contract_close_time=market.get("close_time"),
-                        target=market.get("floor_strike")))
+                        target=market.get("floor_strike"),
+                        request_started_at=book_observation.request_started_at))
                 except Exception:
                     LOGGER.exception("REST stale-market fallback failed for %s", asset)
             LOGGER.info("stream health\n%s", self.health.render())
@@ -278,16 +328,22 @@ class StreamRecorder:
         except asyncio.TimeoutError:
             pass
         finally:
-            await self.stop()
+            self.stop_event.set()
+            if self.ws:
+                await self.ws.stop()
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            await self.rest.close()
+            await self.dispatcher.stop()
+            self.store.close()
 
     async def stop(self):
         self.stop_event.set()
         if self.ws:
             await self.ws.stop()
         await self.rest.close()
+        await self.dispatcher.stop()
         self.store.close()
 
     def summary(self, elapsed_seconds):
@@ -299,4 +355,7 @@ class StreamRecorder:
             "missing_sequences": 0 if self.ws is None else self.ws.sequence.gaps,
             "reconnects": 0 if self.ws is None else self.ws.reconnects,
             "latencies_ms": list(self.receive_latencies),
+            "request_latencies_ms": list(self.request_latencies),
+            "persistence_latencies_ms": list(self.persistence_latencies),
+            "direct_dispatch": self.dispatcher.summary(),
         }

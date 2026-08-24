@@ -57,7 +57,8 @@ class LiveTailOrderingTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.path = Path(self.directory.name) / "raw.db"
-        self.store = RawEventStore(self.path).open()
+        # Phase 3.2.1 regressions explicitly exercise the legacy timestamp path.
+        self.store = RawEventStore(self.path, enable_ingest=False).open()
 
     def tearDown(self):
         self.store.close()
@@ -174,7 +175,7 @@ class LiveTailOrderingTests(unittest.TestCase):
                     ("orderbook_delta", 50, 51), ("contract_reset", 10, 60)]
 
         def writer():
-            with RawEventStore(self.path) as store:
+            with RawEventStore(self.path, enable_ingest=False) as store:
                 for index, (kind, receive_ms, process_ms) in enumerate(schedule):
                     event = raw(kind, receive_ms / 1000, process_ms / 1000,
                                 event_id=f"threaded-{index}", sequence=index + 1)

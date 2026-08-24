@@ -4,6 +4,8 @@
 
 # Data files (except sample data)
 *.db
+*.db-shm
+*.db-wal
 *.csv
 *.log
 !data/sample_features.csv

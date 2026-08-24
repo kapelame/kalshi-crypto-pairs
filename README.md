@@ -64,6 +64,8 @@ trading decisions.
 
 See [PHASE3_SIGNALS.md](PHASE3_SIGNALS.md) for formulas, thresholds, replay
 ordering, derived schema, and structural leakage guards.
+See [PHASE3_2_2_LOW_LATENCY.md](PHASE3_2_2_LOW_LATENCY.md) for new-capture
+availability ordering and low-latency monitor semantics.
 
 ### 3. Check data quality
 
@@ -187,6 +189,8 @@ Use this data with `train.py` to build and evaluate models before collecting you
 | `replay_stream.py` | Deterministic raw-event replay into derived features. |
 | `benchmark_signals.py` | Read-only bounded/full signal performance benchmark. |
 | `monitor_signals.py` | Read-only five-asset research signal monitor. |
+| `collect_live_signals.py` | Direct event-driven read-only SignalEngine plus raw recording. |
+| `benchmark_direct_live.py` | Synthetic direct-dispatch burst benchmark. |
 | `export_checkpoints.py` | Frozen checkpoint export with post-freeze outcomes. |
 | `research_summary.py` | Descriptive completed-window statistics. |
 
@@ -201,6 +205,15 @@ python replay_stream.py --db raw_stream.db --features-db features.db \
 Use `--snapshot-mode diagnostic --diagnostic-hz 1` for throttled diagnostics.
 `--snapshot-mode all` is retained only for deep debugging. See
 `PHASE3_2_PERFORMANCE.md` for architecture and measured benchmarks.
+
+Phase 3.2.3 can update the in-memory research engine immediately after each raw
+commit, without a SQLite tail poll in the critical state path:
+
+```bash
+python collect_live_signals.py --db direct_raw.db --env-file .env
+```
+
+See `PHASE3_2_3_DIRECT_LIVE.md` for handoff, failure, and latency semantics.
 
 ## Fee Model
 

@@ -49,3 +49,13 @@ def receive_latency_ms(event):
 
 def processing_latency_ms(event):
     return latency_ms(event.local_receive_timestamp, event.processing_timestamp)
+
+
+def request_latency_ms(event):
+    """HTTP request start to complete local response availability."""
+    return latency_ms(event.request_started_at, event.local_receive_timestamp)
+
+
+def persistence_latency_ms(event, persistence_timestamp):
+    """Local response/message availability to raw-store write boundary."""
+    return latency_ms(event.local_receive_timestamp, persistence_timestamp)

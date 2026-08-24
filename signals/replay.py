@@ -10,7 +10,8 @@ from dataclasses import dataclass
 
 from .engine import SignalEngine
 from .ordering import (TABLE_ORDER, event_from_row, event_order_key,
-                       generation_projection, select_columns)
+                       generation_projection, has_ingest_ledger,
+                       read_ingest_batch, select_columns, table_specs)
 from streaming.timeutil import parse_timestamp
 
 
@@ -24,6 +25,10 @@ class RawEventReader:
         connection = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
         cursors, heap = [], []
         try:
+            if has_ingest_ledger(connection):
+                yield from self._read_ingest(
+                    connection, market_ticker, stop_timestamp, start_timestamp)
+                return
             for priority, table in enumerate(TABLE_ORDER):
                 if not connection.execute(
                         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
@@ -64,6 +69,24 @@ class RawEventReader:
                     heapq.heappush(heap, (event_order_key(following), cursor_index, following))
         finally:
             connection.close()
+
+    def _read_ingest(self, connection, market_ticker, stop_timestamp, start_timestamp):
+        after = 0
+        specs = table_specs(connection)
+        while True:
+            events = read_ingest_batch(connection, after, self.fetch_size, specs)
+            if not events:
+                return
+            after = events[-1]["_ingest_sequence"]
+            for event in events:
+                if market_ticker and event.get("market_ticker") != market_ticker:
+                    continue
+                timestamp = event["local_receive_timestamp"]
+                if start_timestamp and timestamp < start_timestamp:
+                    continue
+                if stop_timestamp and timestamp > stop_timestamp:
+                    continue
+                yield event
 
     @staticmethod
     def _event(row, priority):
