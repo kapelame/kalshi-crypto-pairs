@@ -185,9 +185,22 @@ Use this data with `train.py` to build and evaluate models before collecting you
 | `collect_stream.py` | Read-only five-asset WebSocket/REST raw-event recorder. |
 | `diagnose_stream.py` | Time-limited streaming health and latency diagnostic. |
 | `replay_stream.py` | Deterministic raw-event replay into derived features. |
+| `benchmark_signals.py` | Read-only bounded/full signal performance benchmark. |
 | `monitor_signals.py` | Read-only five-asset research signal monitor. |
 | `export_checkpoints.py` | Frozen checkpoint export with post-freeze outcomes. |
 | `research_summary.py` | Descriptive completed-window statistics. |
+
+Phase 3.2 replay defaults to research checkpoints rather than per-event feature
+rows:
+
+```bash
+python replay_stream.py --db raw_stream.db --features-db features.db \
+  --snapshot-mode checkpoints --speed 0
+```
+
+Use `--snapshot-mode diagnostic --diagnostic-hz 1` for throttled diagnostics.
+`--snapshot-mode all` is retained only for deep debugging. See
+`PHASE3_2_PERFORMANCE.md` for architecture and measured benchmarks.
 
 ## Fee Model
 

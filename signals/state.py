@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 
 from .history import TimeHistory
+from .incremental import TradeWindowSet
 from streaming.contracts import RolloverState
 
 
@@ -28,6 +29,11 @@ class AssetState:
     trades: list = field(default_factory=list)
     bid_book: dict = field(default_factory=dict)
     ask_book: dict = field(default_factory=dict)
+    bid_prices: list = field(default_factory=list)
+    ask_prices: list = field(default_factory=list)
+    cached_book_features: dict = field(default_factory=dict)
+    cached_price_features: dict = field(default_factory=dict)
+    trade_windows: TradeWindowSet | None = None
     quote_time: float | None = None
     book_time: float | None = None
     yes_bid: float | None = None
@@ -51,4 +57,5 @@ class AssetState:
             probability=TimeHistory(config.history_retention_seconds),
             velocity_histories={window: TimeHistory(config.history_retention_seconds)
                                 for window in config.velocity_windows},
-            price=TimeHistory(config.history_retention_seconds))
+            price=TimeHistory(config.history_retention_seconds),
+            trade_windows=TradeWindowSet(config.trade_windows))

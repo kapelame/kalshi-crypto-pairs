@@ -1,6 +1,7 @@
 """Single causal feature engine shared by live-tail processing and replay."""
 
 import math
+from bisect import bisect_left, insort
 from copy import deepcopy
 
 from streaming import ASSET_SERIES
@@ -10,6 +11,7 @@ from streaming.timeutil import parse_timestamp
 
 from .config import SignalConfig
 from .mathutil import mad, mean, median, safe_ratio, stddev, log_return
+from .incremental import TradeWindowSet, top_book_features
 from .state import AssetState, ContractState
 
 
@@ -41,8 +43,8 @@ class SignalEngine:
         self.sequence = SequenceValidator()
         self.sequence_problems = {asset: set() for asset in ASSET_SERIES}
 
-    def process(self, event):
-        """Consume one raw event mapping and return a frozen feature snapshot."""
+    def process(self, event, emit_snapshot=True):
+        """Consume one raw event; optionally materialize its full frozen snapshot."""
         timestamp = parse_timestamp(event["local_receive_timestamp"]).timestamp()
         if self.last_event_time is not None and timestamp < self.last_event_time:
             raise ValueError("raw events are not in causal order")
@@ -61,17 +63,20 @@ class SignalEngine:
         # validated. Transport validation still sees the complete channel.
         sequence_replayable = kind in {
             "ticker", "trade", "orderbook_snapshot", "orderbook_delta"}
+        sequence_changed = False
         if sequence_replayable and sid is not None and sequence is not None:
             observation = self.sequence.observe_result(
                 sid, sequence, channel_family(kind),
                 event.get("sequence_generation"),
                 bootstrap=kind == "orderbook_snapshot")
             if observation.generation_changed:
+                sequence_changed = True
                 for candidate_asset, candidate in self.assets.items():
                     self.sequence_problems[candidate_asset].clear()
                     self.sequence_problems[candidate_asset].add("bootstrap")
                     candidate.sequence_healthy = False
             if not observation.healthy:
+                sequence_changed = True
                 affected = (self.assets if observation.family == "orderbook"
                             else (asset,))
                 for candidate_asset in affected:
@@ -80,7 +85,9 @@ class SignalEngine:
         # A reset must finalize the untouched old contract before installing new metadata.
         if kind == "contract_reset":
             self._reset(state, payload, event, timestamp)
-        else:
+        elif (kind in {"ticker", "market_lifecycle", "orderbook_snapshot"} or
+              state.contract.ticker is None or
+              event.get("market_ticker") != state.contract.ticker):
             self._update_contract(state, event, timestamp)
         ticker_matches = (state.expected_ticker is None or
                           event.get("market_ticker") == state.expected_ticker)
@@ -100,7 +107,10 @@ class SignalEngine:
             self._trade(state, payload, timestamp)
         elif kind == "market_lifecycle":
             self._lifecycle(state, payload, event, timestamp)
-        self._resolve_if_ready(state, timestamp)
+        if kind in {"ticker", "orderbook_snapshot", "market_lifecycle", "contract_reset"} or sequence_changed:
+            self._resolve_if_ready(state, timestamp)
+        if not emit_snapshot:
+            return None
         return self.snapshot(asset, timestamp, event.get("event_id"))
 
     def _update_contract(self, state, event, timestamp):
@@ -172,6 +182,7 @@ class SignalEngine:
         if price is not None and price > 0:
             state.price.append(timestamp, price)
             state.contract.price_values.append((timestamp, price))
+            state.cached_price_features = self._calculate_price_features(state, timestamp)
 
     def _book_snapshot(self, state, payload, source, timestamp):
         msg = payload.get("msg", payload)
@@ -187,6 +198,10 @@ class SignalEngine:
             state.bid_book = {float(price): float(qty) for price, qty in yes}
             # Phase 2 subscribes with use_yes_price=true, so NO book is YES ask scale.
             state.ask_book = {float(price): float(qty) for price, qty in no}
+        state.bid_prices = sorted(state.bid_book)
+        state.ask_prices = sorted(state.ask_book)
+        state.cached_book_features = top_book_features(
+            state.bid_book, state.ask_book, state.bid_prices, state.ask_prices)
         state.book_time = timestamp
 
     def _book_delta(self, state, payload, timestamp):
@@ -195,11 +210,20 @@ class SignalEngine:
         if side not in ("yes", "no") or price is None or delta is None:
             return
         book = state.bid_book if side == "yes" else state.ask_book
+        prices = state.bid_prices if side == "yes" else state.ask_prices
         quantity = book.get(price, 0.0) + delta
         if quantity <= 0:
-            book.pop(price, None)
+            if price in book:
+                book.pop(price)
+                index = bisect_left(prices, price)
+                if index < len(prices) and prices[index] == price:
+                    prices.pop(index)
         else:
+            if price not in book:
+                insort(prices, price)
             book[price] = quantity
+        state.cached_book_features = top_book_features(
+            state.bid_book, state.ask_book, state.bid_prices, state.ask_prices)
         state.book_time = timestamp
 
     def _trade(self, state, payload, timestamp):
@@ -211,8 +235,7 @@ class SignalEngine:
             direction = None
         if count is not None:
             state.trades.append((timestamp, count, direction, yes_price))
-            cutoff = timestamp - self.config.history_retention_seconds
-            state.trades[:] = [trade for trade in state.trades if trade[0] >= cutoff]
+            state.trade_windows.append(timestamp, count, direction)
         if yes_price is not None:
             state.last_trade = yes_price
 
@@ -265,6 +288,9 @@ class SignalEngine:
         state.last_trade = state.volume = state.open_interest = None
         state.quote_time = state.book_time = None
         state.bid_book.clear(); state.ask_book.clear(); state.trades.clear()
+        state.bid_prices.clear(); state.ask_prices.clear()
+        state.cached_book_features.clear(); state.cached_price_features.clear()
+        state.trade_windows = TradeWindowSet(self.config.trade_windows)
         state.checkpoints_emitted.clear()
 
     def _resolve_if_ready(self, state, timestamp):
@@ -315,7 +341,7 @@ class SignalEngine:
                                            if returns else None),
         }
 
-    def snapshot(self, asset, timestamp, watermark, emit_checkpoints=True):
+    def snapshot(self, asset, timestamp, watermark, emit_checkpoints=True, basket=None):
         state = self.assets[asset]
         probability, spread, executable_bid, executable_ask = canonical_probability(
             state.yes_bid, state.yes_ask, state.no_bid, state.no_ask)
@@ -359,7 +385,7 @@ class SignalEngine:
         features.update(self._time_features(state, timestamp, probability is not None,
                                             emit_checkpoints))
         features.update(deepcopy(state.prior_window))
-        basket = self.basket_features(timestamp)
+        basket = basket if basket is not None else self.basket_features(timestamp)
         features.update(self._prior_basket_features())
         features.update(self._btc_features(asset, features, basket))
         features["regime_label"] = classify_regime(basket, self.config)
@@ -376,7 +402,7 @@ class SignalEngine:
             "features": features, "basket": basket,
         }
 
-    def _price_features(self, state, timestamp):
+    def _calculate_price_features(self, state, timestamp):
         result = {}
         current = state.price.values[-1][1] if state.price.values else None
         for window in self.config.price_windows:
@@ -405,46 +431,22 @@ class SignalEngine:
         })
         return result
 
+    def _price_features(self, state, timestamp):
+        # The causal cutoff can advance even without a new price, so snapshots
+        # calculate against their own timestamp. Price work is never performed
+        # for unrelated events when process(..., emit_snapshot=False) is used.
+        return self._calculate_price_features(state, timestamp)
+
     def _book_features(self, state, fresh):
         if not fresh:
             return {key: None for key in (
                 "book_l1_imbalance", "book_top3_imbalance", "book_top5_imbalance",
                 "book_bid_depth", "book_ask_depth", "book_depth_ratio", "book_slope")}
-        bids = sorted(state.bid_book.items(), reverse=True)
-        asks = sorted(state.ask_book.items())
-        def imbalance(n):
-            bid = sum(qty for _, qty in bids[:n]); ask = sum(qty for _, qty in asks[:n])
-            return safe_ratio(bid - ask, bid + ask)
-        bid_depth = sum(qty for _, qty in bids[:5])
-        ask_depth = sum(qty for _, qty in asks[:5])
-        slope = None
-        if len(bids) >= 2 and len(asks) >= 2:
-            slope = ((bids[0][0] - bids[min(4, len(bids)-1)][0]) +
-                     (asks[min(4, len(asks)-1)][0] - asks[0][0]))
-        return {"book_l1_imbalance": imbalance(1), "book_top3_imbalance": imbalance(3),
-                "book_top5_imbalance": imbalance(5), "book_bid_depth": bid_depth,
-                "book_ask_depth": ask_depth, "book_depth_ratio": safe_ratio(bid_depth, ask_depth),
-                "book_slope": slope}
+        return dict(state.cached_book_features or top_book_features(
+            state.bid_book, state.ask_book, state.bid_prices, state.ask_prices))
 
     def _trade_features(self, state, timestamp):
-        result = {}
-        for window in self.config.trade_windows:
-            trades = [trade for trade in state.trades if trade[0] >= timestamp - window]
-            counts = [trade[1] for trade in trades]
-            known = [trade for trade in trades if trade[2] in ("yes", "no")]
-            yes = sum(trade[1] for trade in known if trade[2] == "yes")
-            no = sum(trade[1] for trade in known if trade[2] == "no")
-            half = timestamp - window / 2
-            recent = sum(trade[1] for trade in trades if trade[0] >= half) / (window / 2)
-            earlier = sum(trade[1] for trade in trades if trade[0] < half) / (window / 2)
-            prefix = f"trade_{window}s_"
-            result.update({prefix + "count": len(trades), prefix + "contracts": sum(counts),
-                           prefix + "yes_aggressive": yes if known else None,
-                           prefix + "no_aggressive": no if known else None,
-                           prefix + "imbalance": (safe_ratio(yes - no, yes + no) if known else None),
-                           prefix + "average_size": mean(counts), prefix + "max_size": max(counts) if counts else None,
-                           prefix + "volume_acceleration": recent - earlier})
-        return result
+        return state.trade_windows.features(timestamp)
 
     def _time_features(self, state, timestamp, state_valid, emit_checkpoints=True):
         since = None if state.contract.open_time is None else timestamp - state.contract.open_time

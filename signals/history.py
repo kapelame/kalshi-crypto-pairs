@@ -1,30 +1,32 @@
 """Causal timestamp-based histories; never select a future observation."""
 
-from collections import deque
+from bisect import bisect_left, bisect_right
 
 
 class TimeHistory:
     def __init__(self, retention_seconds=1200):
-        self.values = deque()
+        self.values = []
+        self.timestamps = []
         self.retention = retention_seconds
 
     def append(self, timestamp, value):
         if self.values and timestamp < self.values[-1][0]:
             raise ValueError("events must be processed in nondecreasing event time")
         self.values.append((timestamp, value))
+        self.timestamps.append(timestamp)
         cutoff = timestamp - self.retention
-        while self.values and self.values[0][0] < cutoff:
-            self.values.popleft()
+        expired = bisect_left(self.timestamps, cutoff)
+        if expired:
+            del self.values[:expired]
+            del self.timestamps[:expired]
 
     def at_or_before(self, timestamp):
-        for observed_at, value in reversed(self.values):
-            if observed_at <= timestamp:
-                return observed_at, value
-        return None
+        index = bisect_right(self.timestamps, timestamp) - 1
+        return None if index < 0 else self.values[index]
 
     def since(self, timestamp):
-        return [(observed_at, value) for observed_at, value in self.values
-                if observed_at >= timestamp]
+        index = bisect_left(self.timestamps, timestamp)
+        return self.values[index:]
 
     def change(self, now, window):
         if not self.values:

@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import time
+from collections import deque
 
 from signals.engine import SignalEngine
 from signals.replay import TABLE_ORDER
@@ -32,21 +33,33 @@ class IncrementalRawTail:
         self.pending = []
         self.events_read = 0
         self.caught_up = False
+        self.connection = None
+        self.table_specs = None
 
-    def read_batch(self):
-        connection = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
-        fetched, constraining = [], []
-        try:
-            connection.execute("BEGIN")
+    def _open(self):
+        if self.connection is None:
+            self.connection = sqlite3.connect(
+                f"file:{self.path}?mode=ro", uri=True, check_same_thread=False)
+            specs = []
             for priority, table in enumerate(TABLE_ORDER):
-                present = connection.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
-                if not present:
+                if not self.connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                        (table,)).fetchone():
                     continue
-                columns = {row[1] for row in connection.execute(
+                columns = {row[1] for row in self.connection.execute(
                     f"PRAGMA table_info({table})")}
                 generation = ("sequence_generation" if "sequence_generation" in columns
                               else "NULL AS sequence_generation")
+                specs.append((priority, table, generation))
+            self.table_specs = specs
+        return self.connection
+
+    def read_batch(self):
+        connection = self._open()
+        fetched, constraining = [], []
+        try:
+            connection.execute("BEGIN")
+            for priority, table, generation in self.table_specs:
                 rows = connection.execute(
                     f"SELECT rowid,event_id,event_type,asset,market_ticker,series_ticker,"
                     f"exchange_timestamp,local_receive_timestamp,processing_timestamp,source,"
@@ -64,8 +77,9 @@ class IncrementalRawTail:
                     event["_priority"] = priority
                     fetched.append(event)
             connection.rollback()
-        finally:
-            connection.close()
+        except Exception:
+            connection.rollback()
+            raise
         self.pending.extend(fetched)
         self.pending.sort(key=lambda event: (
             event["local_receive_timestamp"], event["processing_timestamp"],
@@ -82,6 +96,11 @@ class IncrementalRawTail:
         self.caught_up = not constraining and not self.pending
         return ready
 
+    def close(self):
+        if self.connection is not None:
+            self.connection.close()
+            self.connection = None
+
 
 class LiveSignalMonitor:
     def __init__(self, path, batch_size=100, engine=None):
@@ -91,6 +110,10 @@ class LiveSignalMonitor:
         self.raw_watermark = None
         self.events_processed = 0
         self.caught_up = False
+        self.started_at = time.monotonic()
+        self.processing_samples = deque(maxlen=10000)
+        self.maximum_backlog = 0
+        self.catch_up_lag_ms = None
 
     def consume_once(self):
         events = self.tail.read_batch()
@@ -99,16 +122,23 @@ class LiveSignalMonitor:
 
     def _consume(self, events):
         for event in events:
-            self.engine.process(event)
+            started = time.perf_counter()
+            self.engine.process(event, emit_snapshot=False)
+            self.processing_samples.append((time.perf_counter() - started) * 1000)
             self.state_timestamp = event["local_receive_timestamp"]
             self.raw_watermark = event["event_id"]
             self.events_processed += 1
         self.caught_up = self.tail.caught_up
+        self.maximum_backlog = max(self.maximum_backlog, len(self.tail.pending))
+        if self.state_timestamp:
+            from streaming.timeutil import parse_timestamp
+            self.catch_up_lag_ms = max(0.0, (time.time() -
+                parse_timestamp(self.state_timestamp).timestamp()) * 1000)
 
     async def consume_once_async(self):
         events = await asyncio.to_thread(self.tail.read_batch)
-        for offset in range(0, len(events), 8):
-            self._consume(events[offset:offset + 8])
+        for offset in range(0, len(events), 128):
+            self._consume(events[offset:offset + 128])
             await asyncio.sleep(0)
         if not events:
             self.caught_up = self.tail.caught_up
@@ -121,19 +151,29 @@ class LiveSignalMonitor:
         snapshots = {}
         for asset in self.engine.assets:
             snapshot = self.engine.snapshot(asset, self.engine.last_event_time,
-                                            self.raw_watermark, emit_checkpoints=False)
+                                            self.raw_watermark, emit_checkpoints=False,
+                                            basket=basket)
             snapshot["basket"] = basket
             snapshots[asset] = snapshot
         return snapshots, basket
 
     def close(self):
-        return None
+        self.tail.close()
 
 
 def format_monitor(monitor):
     snapshots, basket = monitor.coherent_snapshots()
+    elapsed = max(time.monotonic() - monitor.started_at, 1e-9)
+    rate = monitor.events_processed / elapsed
+    samples = sorted(monitor.processing_samples)
+    def percentile(fraction):
+        return None if not samples else samples[min(len(samples)-1, int(len(samples)*fraction))]
     lines = [f"STATE timestamp={monitor.state_timestamp or '---'} "
              f"watermark={monitor.raw_watermark or '---'} caught_up={'yes' if monitor.caught_up else 'no'}",
+             f"FLOW processed={monitor.events_processed} rate={rate:.0f}/s "
+             f"backlog={len(monitor.tail.pending)} max_backlog={monitor.maximum_backlog} "
+             f"lag_ms={fmt(monitor.catch_up_lag_ms)} proc_ms_p50={fmt(percentile(.50))} "
+             f"p95={fmt(percentile(.95))} p99={fmt(percentile(.99))}",
              "ASSET TICKER WINDOW STATUS TARGET Q_AGE B_AGE ROLLOVER ELIGIBLE REASONS"]
     for asset in ("BTC", "ETH", "SOL", "XRP", "DOGE"):
         snapshot = snapshots.get(asset)
@@ -189,7 +229,7 @@ def main():
     parser.add_argument("--db", default="kalshi_stream_raw.db")
     parser.add_argument("--duration", type=float, default=0)
     parser.add_argument("--refresh", type=float, default=.25)
-    parser.add_argument("--batch-size", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=5000)
     args = parser.parse_args()
     if not os.path.exists(args.db):
         raise SystemExit(f"Raw database not found: {args.db}")

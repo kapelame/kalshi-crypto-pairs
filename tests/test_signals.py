@@ -209,16 +209,20 @@ class ReplayLeakageTests(unittest.IsolatedAsyncioTestCase):
     async def test_replay_determinism_live_equivalence_and_stop_guard(self):
         with tempfile.TemporaryDirectory() as directory:
             raw = Path(directory)/"raw.db"; raw_events = self.create_raw(raw)
-            first = await ReplayEngine(raw).run(speed=0)
-            second = await ReplayEngine(raw).run(speed=0)
+            first = await ReplayEngine(raw).run(
+                speed=0, snapshot_mode="all", collect_snapshots=True)
+            second = await ReplayEngine(raw).run(
+                speed=0, snapshot_mode="all", collect_snapshots=True)
             self.assertEqual(first, second)
             direct_engine = SignalEngine()
             direct = []
             for item in raw_events:
                 direct.append(direct_engine.process({
                     **item.__dict__, "raw_payload": item.raw_payload}))
-            self.assertEqual(first, direct)
-            stopped = await ReplayEngine(raw).run(speed=0, stop_timestamp=iso(5))
+            self.assertEqual(first.collected_snapshots, direct)
+            stopped = await ReplayEngine(raw).run(
+                speed=0, stop_timestamp=iso(5), snapshot_mode="all",
+                collect_snapshots=True)
             self.assertEqual(len(stopped), 2)
             self.assertAlmostEqual(stopped[-1]["features"]["midpoint_up_probability"], .6)
 
@@ -257,10 +261,11 @@ class ReplayLeakageTests(unittest.IsolatedAsyncioTestCase):
             with RawEventStore(path) as store:
                 for item in raw_events:
                     store.append(item)
-            replayed = await ReplayEngine(path).run(speed=0)
+            replayed = await ReplayEngine(path).run(
+                speed=0, snapshot_mode="all", collect_snapshots=True)
             direct_engine = SignalEngine()
             direct = [direct_engine.process(item.__dict__) for item in raw_events]
-            self.assertEqual(replayed, direct)
+            self.assertEqual(replayed.collected_snapshots, direct)
             self.assertNotIn("SEQUENCE_UNHEALTHY",
                              replayed[-1]["features"]["excluded_reasons"])
 
