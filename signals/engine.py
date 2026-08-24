@@ -1,10 +1,10 @@
 """Single causal feature engine shared by live-tail processing and replay."""
 
 import math
-import statistics
 from copy import deepcopy
 
 from streaming import ASSET_SERIES
+from streaming.contracts import ContractRegistry, RolloverState, evaluate_eligibility
 from streaming.timeutil import parse_timestamp
 
 from .config import SignalConfig
@@ -36,6 +36,8 @@ class SignalEngine:
         self.assets = {asset: AssetState.create(asset, self.config) for asset in ASSET_SERIES}
         self.last_event_time = None
         self.event_count = 0
+        self.registry = ContractRegistry()
+        self.sequences = {}
 
     def process(self, event):
         """Consume one raw event mapping and return a frozen feature snapshot."""
@@ -50,33 +52,65 @@ class SignalEngine:
         state = self.assets[asset]
         payload = event.get("raw_payload") or {}
         kind = event["event_type"]
-        self._update_contract(state, event, timestamp)
-        if kind == "ticker":
+        sid, sequence = payload.get("sid"), payload.get("seq", event.get("sequence"))
+        if sid is not None and sequence is not None:
+            previous = self.sequences.get(sid)
+            if previous is not None and sequence != previous + 1:
+                state.sequence_healthy = False
+            self.sequences[sid] = sequence
+        # A reset must finalize the untouched old contract before installing new metadata.
+        if kind == "contract_reset":
+            self._reset(state, payload, event, timestamp)
+        else:
+            self._update_contract(state, event, timestamp)
+        ticker_matches = (state.expected_ticker is None or
+                          event.get("market_ticker") == state.expected_ticker)
+        if kind == "ticker" and ticker_matches:
             self._ticker(state, payload, timestamp)
         elif kind == "underlying_price":
             self._underlying(state, payload, timestamp)
-        elif kind == "orderbook_snapshot":
+        elif kind == "orderbook_snapshot" and ticker_matches:
             self._book_snapshot(state, payload, event.get("source", ""), timestamp)
-        elif kind == "orderbook_delta":
+            state.sequence_healthy = True
+        elif kind == "orderbook_delta" and ticker_matches:
             self._book_delta(state, payload, timestamp)
-        elif kind == "trade":
+        elif kind == "trade" and ticker_matches:
             self._trade(state, payload, timestamp)
-        elif kind == "contract_reset":
-            self._reset(state, payload, event, timestamp)
         elif kind == "market_lifecycle":
-            self._lifecycle(state, payload)
+            self._lifecycle(state, payload, event, timestamp)
+        self._resolve_if_ready(state, timestamp)
         return self.snapshot(asset, timestamp, event.get("event_id"))
 
     def _update_contract(self, state, event, timestamp):
         ticker = event.get("market_ticker")
+        payload = event.get("raw_payload") or {}
+        msg = payload.get("msg", payload)
+        metadata = dict(msg)
+        metadata.setdefault("open_time", event.get("contract_open_time"))
+        metadata.setdefault("close_time", event.get("contract_close_time"))
+        metadata.setdefault("floor_strike", event.get("target"))
+        if ticker:
+            record = self.registry.update(state.asset, ticker, metadata,
+                                          source=event.get("source"),
+                                          timestamp=event.get("local_receive_timestamp"))
         if ticker and state.contract.ticker is None:
             state.contract.ticker = ticker
-        for attr, key in (("open_time", "contract_open_time"),
-                          ("close_time", "contract_close_time")):
-            if event.get(key):
-                setattr(state.contract, attr, parse_timestamp(event[key]).timestamp())
-        if event.get("target") is not None:
-            state.contract.target = float(event["target"])
+            state.expected_ticker = ticker
+            state.rollover_state = RolloverState.PENDING
+            self.registry.expect(state.asset, ticker, pending=True)
+        if ticker == state.contract.ticker:
+            for attr, key in (("open_time", "contract_open_time"),
+                              ("close_time", "contract_close_time")):
+                if event.get(key):
+                    setattr(state.contract, attr, parse_timestamp(event[key]).timestamp())
+            if event.get("target") is not None:
+                state.contract.target = float(event["target"])
+        if ticker == state.expected_ticker:
+            record = self.registry.record(ticker)
+            if record:
+                state.contract.status = record.status
+                state.contract.target = record.target
+                state.contract.window_id = record.window_id
 
     def _ticker(self, state, payload, timestamp):
         msg = payload.get("msg", payload)
@@ -160,22 +194,47 @@ class SignalEngine:
         if yes_price is not None:
             state.last_trade = yes_price
 
-    def _lifecycle(self, state, payload):
+    def _lifecycle(self, state, payload, event, timestamp):
         msg = payload.get("msg", payload)
+        ticker = msg.get("market_ticker") or event.get("market_ticker")
+        record = self.registry.apply_lifecycle(
+            state.asset, ticker, payload, source=event.get("source"),
+            timestamp=event.get("local_receive_timestamp"))
+        if ticker == state.expected_ticker:
+            state.contract.status = record.status
+            state.contract.target = record.target
+            state.contract.window_id = record.window_id
+            if (msg.get("event_type") or payload.get("type")) in {
+                    "settled", "determined", "deactivated"}:
+                state.rollover_state = RolloverState.PENDING
+                self.registry.expect(state.asset, ticker, pending=True)
         result = msg.get("result") or msg.get("market_result")
-        if result in ("yes", "no"):
+        if result in ("yes", "no") and ticker == state.contract.ticker:
             state.contract.result = result
 
     def _reset(self, state, payload, event, timestamp):
         prior = self._finalize_contract(state, payload)
         state.prior_window = prior
+        new_ticker = payload.get("new_ticker") or event.get("market_ticker")
+        metadata = {
+            "status": payload.get("new_status", payload.get("status", "active")),
+            "floor_strike": event.get("target"),
+            "open_time": event.get("contract_open_time"),
+            "close_time": event.get("contract_close_time"),
+        }
+        record = self.registry.update(
+            state.asset, new_ticker, metadata, source=event.get("source"),
+            timestamp=event.get("local_receive_timestamp"))
+        self.registry.expect(state.asset, new_ticker, pending=True)
+        state.expected_ticker = new_ticker
+        state.rollover_state = RolloverState.PENDING
         state.contract = ContractState(
-            ticker=payload.get("new_ticker") or event.get("market_ticker"),
+            ticker=new_ticker,
             open_time=(parse_timestamp(event["contract_open_time"]).timestamp()
                        if event.get("contract_open_time") else timestamp),
             close_time=(parse_timestamp(event["contract_close_time"]).timestamp()
                         if event.get("contract_close_time") else None),
-            target=_float(event.get("target")))
+            target=record.target, status=record.status, window_id=record.window_id)
         state.probability = type(state.probability)(self.config.history_retention_seconds)
         state.velocity_histories = {
             window: type(history)(self.config.history_retention_seconds)
@@ -185,6 +244,31 @@ class SignalEngine:
         state.quote_time = state.book_time = None
         state.bid_book.clear(); state.ask_book.clear(); state.trades.clear()
         state.checkpoints_emitted.clear()
+
+    def _resolve_if_ready(self, state, timestamp):
+        if state.contract.ticker != state.expected_ticker:
+            return
+        prior = state.rollover_state
+        state.rollover_state = RolloverState.RESOLVED
+        decision = self._eligibility(state, timestamp, self._expected_window_id())
+        state.rollover_state = prior
+        if decision.eligible:
+            state.rollover_state = RolloverState.RESOLVED
+            self.registry.mark_resolved(state.asset)
+        elif "ROLLOVER_PENDING" in decision.reasons:
+            state.rollover_state = RolloverState.PENDING
+            self.registry.rollover_by_asset[state.asset] = RolloverState.PENDING
+
+    def _eligibility(self, state, timestamp, expected_window_id=None):
+        quote_fresh = state.quote_time is not None and timestamp - state.quote_time <= self.config.quote_stale_seconds
+        book_fresh = state.book_time is not None and timestamp - state.book_time <= self.config.book_stale_seconds
+        return evaluate_eligibility(
+            ticker=state.contract.ticker, expected_ticker=state.expected_ticker,
+            status=state.contract.status, target=state.contract.target,
+            open_time=state.contract.open_time, close_time=state.contract.close_time,
+            rollover_state=state.rollover_state, quote_fresh=quote_fresh,
+            book_fresh=book_fresh, sequence_healthy=state.sequence_healthy,
+            expected_window_id=expected_window_id, evaluation_timestamp=timestamp)
 
     def _finalize_contract(self, state, reset_payload):
         prices = [value for _, value in state.contract.price_values]
@@ -209,7 +293,7 @@ class SignalEngine:
                                            if returns else None),
         }
 
-    def snapshot(self, asset, timestamp, watermark):
+    def snapshot(self, asset, timestamp, watermark, emit_checkpoints=True):
         state = self.assets[asset]
         probability, spread, executable_bid, executable_ask = canonical_probability(
             state.yes_bid, state.yes_ask, state.no_bid, state.no_ask)
@@ -228,18 +312,30 @@ class SignalEngine:
             "book_fresh": book_fresh, "volume": state.volume,
             "open_interest": state.open_interest,
         }
+        decision = self._eligibility(state, timestamp)
+        features.update({
+            "eligible": decision.eligible,
+            "excluded_reasons": list(decision.reasons),
+            "contract_window_id": decision.contract_window_id,
+            "rollover_state": state.rollover_state.value,
+            "market_status": state.contract.status,
+            "expected_ticker": state.expected_ticker,
+        })
         for window in self.config.probability_windows:
-            features[f"prob_change_{window}s"] = state.probability.change(timestamp, window)
+            features[f"prob_change_{window}s"] = (state.probability.change(timestamp, window)
+                                                      if quote_fresh else None)
         for window in self.config.velocity_windows:
-            features[f"prob_velocity_{window}s"] = state.probability.velocity(timestamp, window)
+            features[f"prob_velocity_{window}s"] = (state.probability.velocity(timestamp, window)
+                                                        if quote_fresh else None)
         for window in self.config.acceleration_windows:
             history = state.velocity_histories.get(window)
-            features[f"prob_acceleration_{window}s"] = (None if history is None else
+            features[f"prob_acceleration_{window}s"] = (None if history is None or not quote_fresh else
                                                           history.velocity(timestamp, window))
         features.update(self._price_features(state, timestamp))
         features.update(self._book_features(state, book_fresh))
         features.update(self._trade_features(state, timestamp))
-        features.update(self._time_features(state, timestamp, probability is not None))
+        features.update(self._time_features(state, timestamp, probability is not None,
+                                            emit_checkpoints))
         features.update(deepcopy(state.prior_window))
         basket = self.basket_features(timestamp)
         features.update(self._prior_basket_features())
@@ -328,7 +424,7 @@ class SignalEngine:
                            prefix + "volume_acceleration": recent - earlier})
         return result
 
-    def _time_features(self, state, timestamp, state_valid):
+    def _time_features(self, state, timestamp, state_valid, emit_checkpoints=True):
         since = None if state.contract.open_time is None else timestamp - state.contract.open_time
         remaining = None if state.contract.close_time is None else state.contract.close_time - timestamp
         flags = {}
@@ -337,29 +433,42 @@ class SignalEngine:
                 due = (state_valid and since >= checkpoint and
                        checkpoint not in state.checkpoints_emitted)
                 flags[f"checkpoint_{checkpoint}s"] = due
-                if due:
+                if due and emit_checkpoints:
                     state.checkpoints_emitted.add(checkpoint)
         return {"seconds_since_contract_open": since,
                 "seconds_to_contract_close": remaining, **flags}
 
     def basket_features(self, timestamp):
         probabilities, velocities, accelerations = {}, {}, {}
+        expected_window = self._expected_window_id()
+        eligibility, excluded = {}, {}
         for asset, state in self.assets.items():
-            quote_age = None if state.quote_time is None else timestamp - state.quote_time
+            decision = self._eligibility(state, timestamp, expected_window)
+            eligibility[asset] = decision.eligible
+            if not decision.eligible:
+                excluded[asset] = list(decision.reasons)
             p = canonical_probability(state.yes_bid, state.yes_ask, state.no_bid, state.no_ask)[0]
-            if quote_age is None or quote_age > self.config.quote_stale_seconds:
+            if not decision.eligible:
                 p = None
             probabilities[asset] = p
-            velocities[asset] = state.probability.velocity(timestamp, 30)
-            accelerations[asset] = state.velocity_histories[30].velocity(timestamp, 30)
+            velocities[asset] = (state.probability.velocity(timestamp, 30)
+                                 if decision.eligible else None)
+            accelerations[asset] = (state.velocity_histories[30].velocity(timestamp, 30)
+                                    if decision.eligible else None)
         valid_p = [value for value in probabilities.values() if value is not None]
         valid_v = [value for value in velocities.values() if value is not None]
         valid_a = [value for value in accelerations.values() if value is not None]
         above = sum(value > .5 + self.config.neutral_band for value in valid_p)
         below = sum(value < .5 - self.config.neutral_band for value in valid_p)
         neutral = len(valid_p) - above - below
-        direction = (f"{above}/5 UP" if above >= 4 else f"{below}/5 DOWN" if below >= 4 else
-                     "NEUTRAL" if neutral == len(valid_p) and valid_p else "MIXED")
+        eligible_count = len(valid_p)
+        if eligible_count == len(ASSET_SERIES) and above >= 4:
+            direction = f"{above}/5 UP"
+        elif eligible_count == len(ASSET_SERIES) and below >= 4:
+            direction = f"{below}/5 DOWN"
+        else:
+            direction = (f"{above} UP / {below} DOWN / {neutral} neutral "
+                         f"(eligible {eligible_count}/{len(ASSET_SERIES)})")
         signs = [1 if value > self.config.synchronization_velocity_tolerance else
                  -1 if value < -self.config.synchronization_velocity_tolerance else 0
                  for value in valid_v]
@@ -372,6 +481,11 @@ class SignalEngine:
         return {
             "probabilities": probabilities, "velocities": velocities,
             "accelerations": accelerations,
+            "eligible_count": eligible_count, "expected_count": len(ASSET_SERIES),
+            "eligible_assets": [asset for asset, valid in eligibility.items() if valid],
+            "excluded_assets": list(excluded), "excluded_reasons": excluded,
+            "contract_window_id": expected_window,
+            "coherent_window": eligible_count == len(ASSET_SERIES),
             "assets_above_0_50": above, "assets_below_0_50": below,
             "assets_neutral": neutral, "mean_up_probability": mean(valid_p),
             "median_up_probability": median(valid_p), "mean_probability_velocity": mean(valid_v),
@@ -390,6 +504,11 @@ class SignalEngine:
                                                velocities["BTC"] - mean(alt_v)),
         }
 
+    def _expected_window_id(self):
+        windows = [state.contract.window_id for state in self.assets.values()
+                   if state.contract.window_id is not None]
+        return max(windows) if windows else None
+
     def _btc_features(self, asset, features, basket):
         btc_p = basket["probabilities"].get("BTC")
         btc_v = basket["velocities"].get("BTC")
@@ -397,10 +516,12 @@ class SignalEngine:
         v = features.get("prob_velocity_30s")
         btc_z = self._current_target_z("BTC")
         z = features.get("volatility_adjusted_target_distance")
+        asset_eligible = asset in basket.get("eligible_assets", [])
+        btc_eligible = "BTC" in basket.get("eligible_assets", [])
         return {
-            "alt_probability_minus_btc": None if asset == "BTC" or p is None or btc_p is None else p - btc_p,
-            "alt_velocity_minus_btc": None if asset == "BTC" or v is None or btc_v is None else v - btc_v,
-            "alt_target_distance_relative_to_btc_factor": (None if asset == "BTC" or z is None or btc_z is None
+            "alt_probability_minus_btc": None if asset == "BTC" or not asset_eligible or not btc_eligible or p is None or btc_p is None else p - btc_p,
+            "alt_velocity_minus_btc": None if asset == "BTC" or not asset_eligible or not btc_eligible or v is None or btc_v is None else v - btc_v,
+            "alt_target_distance_relative_to_btc_factor": (None if asset == "BTC" or not asset_eligible or not btc_eligible or z is None or btc_z is None
                                                             else z - btc_z),
         }
 
@@ -438,8 +559,12 @@ class SignalEngine:
 
 
 def classify_regime(basket, config):
-    if len([p for p in basket["probabilities"].values() if p is not None]) < 5:
-        return "NEUTRAL"
+    eligible = basket.get("eligible_count", len([p for p in basket["probabilities"].values() if p is not None]))
+    if eligible < 5:
+        reasons = basket.get("excluded_reasons", {})
+        if any("ROLLOVER_PENDING" in value for value in reasons.values()):
+            return "ROLLOVER_PENDING"
+        return f"PARTIAL_{eligible}_OF_5" if eligible else "INSUFFICIENT_COHERENT_ASSETS"
     up, down = basket["assets_above_0_50"], basket["assets_below_0_50"]
     if max(up, down) < config.synchronized_min_assets:
         return "NEUTRAL" if basket["assets_neutral"] >= 4 else "FRAGMENTED"
@@ -453,6 +578,8 @@ def classify_regime(basket, config):
 
 
 def reset_regime_label(prior_direction, basket):
+    if basket.get("eligible_count", 5) < 5 or not basket.get("coherent_window", True):
+        return "ROLLOVER_PENDING"
     current = "UP" if basket["assets_above_0_50"] >= 4 else "DOWN" if basket["assets_below_0_50"] >= 4 else "MIXED"
     if current == "MIXED" or prior_direction is None:
         return "FRAGMENTED"

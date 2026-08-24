@@ -8,6 +8,7 @@ import aiohttp
 
 from kalshi_api import parse_market, parse_markets_response, parse_orderbook_response
 from . import ASSET_SERIES
+from .contracts import ACTIVE_STATUSES
 from .events import RawEvent
 from .timeutil import iso_utc
 
@@ -51,7 +52,12 @@ class RestDataClient:
         markets = parse_markets_response(payload)
         if not markets:
             raise RuntimeError(f"no open market for {asset} ({series})")
-        return markets[0]
+        market = markets[0]
+        if (market.get("status") or "").lower() not in ACTIVE_STATUSES:
+            raise RuntimeError(
+                f"discovery returned non-active market for {asset}: "
+                f"{market.get('ticker')} status={market.get('status')}")
+        return market
 
     async def discover_all(self):
         results = await asyncio.gather(

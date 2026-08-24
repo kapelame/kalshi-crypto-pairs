@@ -127,6 +127,14 @@ class RestDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(market["ticker"], "KXDOGE15M-X")
         self.assertEqual(market["yes_bid"], 0.0)
 
+    async def test_discovery_rejects_closed_payload_even_from_open_query(self):
+        client = RestDataClient(session=object())
+        async def fake_get(_path):
+            return {"markets": [{"ticker": "KXSOL15M-OLD", "status": "closed"}]}
+        client._get = fake_get
+        with self.assertRaisesRegex(RuntimeError, "non-active"):
+            await client.discover_asset("SOL")
+
 
 class StoreRolloverHealthTests(unittest.TestCase):
     def test_legacy_collector_migrates_for_doge_without_losing_rows(self):
@@ -175,6 +183,8 @@ class StoreRolloverHealthTests(unittest.TestCase):
         now = "2026-08-23T20:00:00.000000+00:00"
         for index, asset in enumerate(ASSET_SERIES):
             market = {"ticker": f"{ASSET_SERIES[asset]}-{index}",
+                      "status": "active", "open_time": "2026-08-23T20:00:00Z",
+                      "close_time": "2026-08-23T20:15:00Z",
                       "floor_strike": float(index + 1), "yes_bid": 45.0,
                       "yes_ask": 46.0, "no_bid": 54.0, "no_ask": 55.0,
                       "last_price": 45.5, "volume": 0.0, "open_interest": 1.0}

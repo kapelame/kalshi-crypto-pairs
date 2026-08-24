@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 
 from .history import TimeHistory
+from streaming.contracts import RolloverState
 
 
 @dataclass
@@ -14,6 +15,8 @@ class ContractState:
     probability_values: list = field(default_factory=list)
     price_values: list = field(default_factory=list)
     result: str | None = None
+    status: str | None = None
+    window_id: str | None = None
 
 
 @dataclass
@@ -37,6 +40,9 @@ class AssetState:
     contract: ContractState = field(default_factory=ContractState)
     prior_window: dict = field(default_factory=dict)
     checkpoints_emitted: set = field(default_factory=set)
+    expected_ticker: str | None = None
+    rollover_state: RolloverState = RolloverState.CURRENT
+    sequence_healthy: bool = True
 
     @classmethod
     def create(cls, asset, config):

@@ -51,6 +51,13 @@ def underlying(asset, seconds, price, **kwargs):
     return event("underlying_price", asset, seconds, {"usd_price": price}, **kwargs)
 
 
+def book(asset, seconds, **kwargs):
+    payload = {"orderbook_fp": {"yes_dollars": [["0.40", "10"]],
+                                "no_dollars": [["0.55", "10"]]}}
+    return event("orderbook_snapshot", asset, seconds, payload,
+                 source="kalshi_rest_recovery", **kwargs)
+
+
 class ProbabilityHistoryTests(unittest.TestCase):
     def test_canonical_probability_and_crossed_missing(self):
         probability, spread, bid, ask = canonical_probability(.49, .53, .47, .51)
@@ -87,7 +94,8 @@ class CrossAssetAndRegimeTests(unittest.TestCase):
         engine = SignalEngine()
         snapshots = []
         for asset, probability in zip(ASSET_SERIES, probabilities):
-            snapshots.append(engine.process(ticker(asset, second, probability)))
+            engine.process(ticker(asset, second, probability))
+            snapshots.append(engine.process(book(asset, second)))
         return engine, snapshots[-1]
 
     def test_breadth_dispersion_and_btc_residual(self):

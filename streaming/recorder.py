@@ -6,6 +6,7 @@ from collections import Counter
 
 from . import ASSET_SERIES
 from .events import RawEvent, StreamSchemaError, make_ws_event
+from .contracts import ContractRegistry
 from .health import HealthMonitor
 from .raw_store import RawEventStore
 from .rest import RestDataClient
@@ -29,6 +30,7 @@ def build_reset_event(asset, old_market, new_market, prior_final, received_at=No
         "previous_settlement": (None if prior_final is None else
                                 prior_final.get("result") or None),
         "new_target": new_market.get("floor_strike"),
+        "new_status": new_market.get("status"),
         "opening_timestamp": new_market.get("open_time"),
         "prior_contract_final_market_state": prior_final,
     }
@@ -48,7 +50,8 @@ class StreamRecorder:
                  underlying_seconds=2, dotenv_path=".env"):
         self.store = RawEventStore(db_path)
         self.rest = RestDataClient()
-        self.health = HealthMonitor()
+        self.registry = ContractRegistry()
+        self.health = HealthMonitor(self.registry)
         self.discovery_seconds = discovery_seconds
         self.underlying_seconds = underlying_seconds
         self.dotenv_path = dotenv_path
@@ -121,13 +124,20 @@ class StreamRecorder:
         asset = self.health.ticker_to_asset.get(ticker)
         if asset is None:
             return
-        market = self.markets[asset]
         try:
+            record = self.registry.record(ticker)
+            if record is None:
+                return
+            market = record.as_market()
             if kind in ("ticker", "trade", "orderbook_snapshot", "orderbook_delta"):
                 self.health.update_ws(payload, received_at, sequence_healthy)
                 event = make_ws_event(payload, asset, ASSET_SERIES[asset], market,
                                       received_at)
             elif kind in LIFECYCLE_TYPES:
+                record = self.health.apply_lifecycle(asset, ticker, payload, received_at)
+                market = record.as_market()
+                if self.registry.expected_by_asset.get(asset) == ticker:
+                    self.markets[asset] = {**self.markets[asset], **market}
                 event = RawEvent(
                     event_type="market_lifecycle", asset=asset,
                     market_ticker=ticker, series_ticker=ASSET_SERIES[asset],
@@ -162,11 +172,23 @@ class StreamRecorder:
         while not self.stop_event.is_set():
             await asyncio.sleep(self.discovery_seconds)
             try:
-                latest = await self.rest.discover_all()
                 changed = False
-                for asset, new_market in latest.items():
+                for asset in ASSET_SERIES:
+                    try:
+                        new_market = await self.rest.discover_asset(asset)
+                    except Exception as exc:
+                        LOGGER.warning("REST rollover discovery pending for %s: %s", asset, exc)
+                        continue
                     old = self.markets[asset]
                     if old["ticker"] == new_market["ticker"]:
+                        # Same ticker metadata can improve after activation (notably target).
+                        received = iso_utc()
+                        self.registry.update(asset, new_market["ticker"], new_market,
+                                             source="kalshi_rest_discovery", timestamp=received)
+                        self.health.refresh_market_metadata(asset, new_market, received)
+                        merged = self.registry.record(new_market["ticker"]).as_market()
+                        # Retain quote/volume fields from the newest REST payload too.
+                        self.markets[asset] = {**new_market, **merged}
                         continue
                     changed = True
                     try:
