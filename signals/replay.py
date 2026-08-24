@@ -8,26 +8,10 @@ import json
 import sqlite3
 from dataclasses import dataclass
 
-from streaming.timeutil import parse_timestamp
-
 from .engine import SignalEngine
-
-
-TABLE_ORDER = [
-    "market_lifecycle_events", "contract_reset_events", "ticker_events",
-    "trade_events", "orderbook_snapshots", "orderbook_deltas",
-    "underlying_price_events",
-]
-COLUMNS = ("_rowid", "event_id", "event_type", "asset", "market_ticker",
-           "series_ticker", "exchange_timestamp", "local_receive_timestamp",
-           "processing_timestamp", "source", "raw_payload", "contract_open_time",
-           "contract_close_time", "target", "sequence", "sequence_generation")
-
-
-def event_order_key(event):
-    return (parse_timestamp(event["local_receive_timestamp"]),
-            parse_timestamp(event["processing_timestamp"]),
-            event["_priority"], event["_rowid"])
+from .ordering import (TABLE_ORDER, event_from_row, event_order_key,
+                       generation_projection, select_columns)
+from streaming.timeutil import parse_timestamp
 
 
 class RawEventReader:
@@ -46,12 +30,8 @@ class RawEventReader:
                         (table,)).fetchone():
                     continue
                 columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
-                generation = ("sequence_generation" if "sequence_generation" in columns
-                              else "NULL AS sequence_generation")
-                query = (f"SELECT rowid,event_id,event_type,asset,market_ticker,series_ticker,"
-                         f"exchange_timestamp,local_receive_timestamp,processing_timestamp,source,"
-                         f"raw_payload,contract_open_time,contract_close_time,target,sequence,"
-                         f"{generation} FROM {table}")
+                generation = generation_projection(columns)
+                query = f"SELECT {select_columns(generation)} FROM {table}"
                 clauses, params = [], []
                 if market_ticker:
                     clauses.append("market_ticker=?"); params.append(market_ticker)
@@ -87,10 +67,7 @@ class RawEventReader:
 
     @staticmethod
     def _event(row, priority):
-        event = dict(zip(COLUMNS, row))
-        event["raw_payload"] = json.loads(event["raw_payload"])
-        event["_priority"] = priority
-        return event
+        return event_from_row(row, priority)
 
     @staticmethod
     def _rowid_bound(connection, table, timestamp, upper):

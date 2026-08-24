@@ -3,19 +3,23 @@
 
 import argparse
 import asyncio
-import json
 import os
 import sqlite3
 import time
 from collections import deque
+from datetime import timedelta
 
 from signals.engine import SignalEngine
-from signals.replay import TABLE_ORDER
+from signals.ordering import (TABLE_ORDER, event_from_row, event_order_key,
+                              generation_projection, select_columns)
+from streaming.timeutil import parse_timestamp, utc_now
 
-COLUMNS = ("_rowid", "event_id", "event_type", "asset", "market_ticker",
-           "series_ticker", "exchange_timestamp", "local_receive_timestamp",
-           "processing_timestamp", "source", "raw_payload", "contract_open_time",
-           "contract_close_time", "target", "sequence", "sequence_generation")
+
+# REST observations capture receive time before an HTTP request whose enforced
+# total timeout is 15 seconds. Five seconds cover SQLite's default busy timeout.
+# A row beyond this processing-time boundary cannot later introduce an earlier
+# receive timestamp under the recorder's synchronous append contract.
+DEFAULT_CAUSAL_LATENESS_SECONDS = 20.0
 
 
 def fmt(value, signed=False):
@@ -25,12 +29,20 @@ def fmt(value, signed=False):
 
 
 class IncrementalRawTail:
-    """Bounded per-table reads with a conservative causal merge frontier."""
-    def __init__(self, path, batch_size=100):
+    """Rowid-paginated live merge behind a producer-safe causal watermark."""
+    def __init__(self, path, batch_size=100,
+                 causal_lateness_seconds=DEFAULT_CAUSAL_LATENESS_SECONDS,
+                 clock=utc_now, max_buffer_events=250_000):
         self.path = str(path)
         self.batch_size = batch_size
+        self.causal_lateness_seconds = causal_lateness_seconds
+        self.clock = clock
+        self.max_buffer_events = max_buffer_events
         self.rowids = {table: 0 for table in TABLE_ORDER}
+        self.processing_cursors = {table: None for table in TABLE_ORDER}
         self.pending = []
+        self.backlog = 0
+        self.buffer_high_water = 0
         self.events_read = 0
         self.caught_up = False
         self.connection = None
@@ -48,53 +60,103 @@ class IncrementalRawTail:
                     continue
                 columns = {row[1] for row in self.connection.execute(
                     f"PRAGMA table_info({table})")}
-                generation = ("sequence_generation" if "sequence_generation" in columns
-                              else "NULL AS sequence_generation")
+                generation = generation_projection(columns)
                 specs.append((priority, table, generation))
             self.table_specs = specs
         return self.connection
 
-    def read_batch(self):
+    def _processing_frontier(self, connection):
+        """Latest committed processing time under the single-writer contract."""
+        maxima, latest_rowids = [], {}
+        for _, table, _ in self.table_specs:
+            value = connection.execute(
+                f"SELECT rowid,processing_timestamp FROM {table} "
+                "ORDER BY rowid DESC LIMIT 1").fetchone()
+            if value:
+                latest_rowids[table] = value[0]
+                maxima.append(parse_timestamp(value[1]))
+            else:
+                latest_rowids[table] = 0
+        # Wall time is also a lower processing bound for work that has not yet
+        # been constructed. The causal-lateness contract accounts for REST work
+        # that captured receive time before that point.
+        return max([self.clock(), *maxima]), latest_rowids
+
+    def read_batch(self, final=False):
         connection = self._open()
-        fetched, constraining = [], []
+        fetched, unseen_processing = [], []
+        batch_constrained = False
         try:
             connection.execute("BEGIN")
+            committed_frontier, latest_rowids = self._processing_frontier(connection)
             for priority, table, generation in self.table_specs:
-                rows = connection.execute(
-                    f"SELECT rowid,event_id,event_type,asset,market_ticker,series_ticker,"
-                    f"exchange_timestamp,local_receive_timestamp,processing_timestamp,source,"
-                    f"raw_payload,contract_open_time,contract_close_time,target,sequence,"
-                    f"{generation} "
-                    f"FROM {table} WHERE rowid>? ORDER BY rowid LIMIT ?",
-                    (self.rowids[table], self.batch_size)).fetchall()
+                available = max(0, self.max_buffer_events -
+                                len(self.pending) - len(fetched))
+                limit = min(self.batch_size, available)
+                rows = ([] if limit == 0 else connection.execute(
+                    f"SELECT {select_columns(generation)} FROM {table} "
+                    "WHERE rowid>? ORDER BY rowid LIMIT ?",
+                    (self.rowids[table], limit)).fetchall())
                 if rows:
+                    previous = self.processing_cursors[table]
+                    for row in rows:
+                        processed = parse_timestamp(row[8])
+                        if previous is not None and processed < previous:
+                            raise ValueError(
+                                f"{table} processing timestamps are not append-monotonic")
+                        previous = processed
+                    self.processing_cursors[table] = previous
                     self.rowids[table] = rows[-1][0]
-                if len(rows) == self.batch_size:
-                    constraining.append(rows[-1][7])
                 for row in rows:
-                    event = dict(zip(COLUMNS, row))
-                    event["raw_payload"] = json.loads(event["raw_payload"])
-                    event["_priority"] = priority
-                    fetched.append(event)
+                    fetched.append(event_from_row(row, priority))
+                following = connection.execute(
+                    f"SELECT processing_timestamp FROM {table} "
+                    "WHERE rowid>? ORDER BY rowid LIMIT 1",
+                    (self.rowids[table],)).fetchone()
+                if following:
+                    batch_constrained = True
+                    unseen_processing.append(parse_timestamp(following[0]))
+                elif committed_frontier is not None:
+                    # Any future append is constructed after the latest commit:
+                    # RawEventStore.append is synchronous and single-writer.
+                    unseen_processing.append(committed_frontier)
             connection.rollback()
         except Exception:
             connection.rollback()
             raise
         self.pending.extend(fetched)
-        self.pending.sort(key=lambda event: (
-            event["local_receive_timestamp"], event["processing_timestamp"],
-            event["_priority"], event["_rowid"]))
-        frontier = min(constraining) if constraining else None
-        if frontier is None:
+        self.pending.sort(key=event_order_key)
+        if final and batch_constrained:
+            # The caller has declared the source static, but rows beyond this
+            # source-row batch may still sort before the rows just fetched.
+            ready = []
+        elif final:
             ready, self.pending = self.pending, []
         else:
+            frontier = (None if not unseen_processing else
+                        min(unseen_processing) - timedelta(
+                            seconds=self.causal_lateness_seconds))
             split = 0
-            while split < len(self.pending) and self.pending[split]["local_receive_timestamp"] <= frontier:
+            while (frontier is not None and split < len(self.pending) and
+                   parse_timestamp(self.pending[split]["local_receive_timestamp"]) < frontier):
                 split += 1
             ready, self.pending = self.pending[:split], self.pending[split:]
         self.events_read += len(ready)
-        self.caught_up = not constraining and not self.pending
+        self.caught_up = not batch_constrained
+        self.backlog = sum(
+            max(0, latest_rowids.get(table, 0) - self.rowids[table])
+            for table in self.rowids)
+        self.buffer_high_water = max(self.buffer_high_water, len(self.pending))
         return ready
+
+    def drain(self):
+        """Drain a database the caller has established is no longer being written."""
+        output = []
+        while True:
+            events = self.read_batch(final=True)
+            output.extend(events)
+            if not events and not self.pending:
+                return output
 
     def close(self):
         if self.connection is not None:
@@ -103,8 +165,9 @@ class IncrementalRawTail:
 
 
 class LiveSignalMonitor:
-    def __init__(self, path, batch_size=100, engine=None):
-        self.tail = IncrementalRawTail(path, batch_size)
+    def __init__(self, path, batch_size=100, engine=None,
+                 causal_lateness_seconds=DEFAULT_CAUSAL_LATENESS_SECONDS):
+        self.tail = IncrementalRawTail(path, batch_size, causal_lateness_seconds)
         self.engine = engine or SignalEngine()
         self.state_timestamp = None
         self.raw_watermark = None
@@ -129,7 +192,7 @@ class LiveSignalMonitor:
             self.raw_watermark = event["event_id"]
             self.events_processed += 1
         self.caught_up = self.tail.caught_up
-        self.maximum_backlog = max(self.maximum_backlog, len(self.tail.pending))
+        self.maximum_backlog = max(self.maximum_backlog, self.tail.backlog)
         if self.state_timestamp:
             from streaming.timeutil import parse_timestamp
             self.catch_up_lag_ms = max(0.0, (time.time() -
@@ -171,7 +234,9 @@ def format_monitor(monitor):
     lines = [f"STATE timestamp={monitor.state_timestamp or '---'} "
              f"watermark={monitor.raw_watermark or '---'} caught_up={'yes' if monitor.caught_up else 'no'}",
              f"FLOW processed={monitor.events_processed} rate={rate:.0f}/s "
-             f"backlog={len(monitor.tail.pending)} max_backlog={monitor.maximum_backlog} "
+             f"backlog={monitor.tail.backlog} max_backlog={monitor.maximum_backlog} "
+             f"reorder_buffer={len(monitor.tail.pending)} "
+             f"buffer_hwm={monitor.tail.buffer_high_water} "
              f"lag_ms={fmt(monitor.catch_up_lag_ms)} proc_ms_p50={fmt(percentile(.50))} "
              f"p95={fmt(percentile(.95))} p99={fmt(percentile(.99))}",
              "ASSET TICKER WINDOW STATUS TARGET Q_AGE B_AGE ROLLOVER ELIGIBLE REASONS"]
